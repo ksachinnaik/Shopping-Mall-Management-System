@@ -1,1 +1,294 @@
+from openai import AzureOpenAI
+import networkx as nx
+from cdlib import algorithms
+import os
+from dotenv import load_dotenv
+from constants import DOCUMENTS
+
+# ==============================
+# LOAD ENV
+# ==============================
+load_dotenv()
+
+# ==============================
+# AZURE CLIENT
+# ==============================
+client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION")
+)
+
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+# ==============================
+# SYNONYMS (MERGING)
+# ==============================
+SYNONYMS = {
+    "climate change": ["warming world", "higher temperatures"],
+    "renewable energy": ["solar energy", "wind energy", "hydropower", "biomass"],
+    "water": ["clean water", "safe water", "water resources"],
+    "agriculture": ["crops", "farming"]
+}
+
+COMMON_NODES = ["energy", "system", "process"]
+
+# ==============================
+# NORMALIZATION
+# ==============================
+def normalize_entity(entity):
+    entity = entity.lower().strip()
+    entity = entity.replace(".", "").replace(",", "")
+
+    for key, values in SYNONYMS.items():
+        if entity == key or entity in values:
+            return key
+
+    return entity
+
+
+def is_valid_entity(entity):
+    if len(entity.split()) > 3:
+        return False
+    if entity in COMMON_NODES:
+        return False
+    return True
+
+
+# ==============================
+# SPLIT DOCUMENTS
+# ==============================
+def split_documents_into_chunks(documents, chunk_size=600, overlap_size=100):
+    chunks = []
+    for doc in documents:
+        for i in range(0, len(doc), chunk_size - overlap_size):
+            chunks.append(doc[i:i + chunk_size])
+    return chunks
+
+
+# ==============================
+# EXTRACT ELEMENTS
+# ==============================
+def extract_elements_from_chunks(chunks):
+    elements = []
+
+    for i, chunk in enumerate(chunks):
+        print(f"Chunk {i}/{len(chunks)}")
+
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """Extract entities and relationships.
+
+Rules:
+- Entities must be 1–2 words
+- Use lowercase
+- Avoid long phrases
+
+Format:
+
+Entities:
+climate change
+agriculture
+
+Relationships:
+climate change -> affects -> agriculture
+"""
+                },
+                {"role": "user", "content": chunk}
+            ]
+        )
+
+        content = response.choices[0].message.content.strip()
+        print(content)
+        elements.append(content)
+
+    return elements
+
+
+# ==============================
+# CLEAN TEXT
+# ==============================
+def clean_text(text):
+    return text.replace("**", "").replace("```", "").strip()
+
+
+# ==============================
+# BUILD GRAPH (FINAL FIXED)
+# ==============================
+def build_graph_from_summaries(summaries):
+    G = nx.Graph()
+
+    for summary in summaries:
+        summary = clean_text(summary)
+        lines = summary.split("\n")
+
+        entities_section = False
+        relationships_section = False
+
+        for line in lines:
+            line = line.strip()
+
+            if line.lower().startswith("entities"):
+                entities_section = True
+                relationships_section = False
+                continue
+
+            if line.lower().startswith("relationships"):
+                entities_section = False
+                relationships_section = True
+                continue
+
+            # ENTITIES
+            if entities_section and line:
+                entity = normalize_entity(line)
+                if is_valid_entity(entity):
+                    G.add_node(entity)
+
+            # RELATIONSHIPS
+            elif relationships_section and "->" in line:
+                parts = [p.strip() for p in line.split("->")]
+
+                if len(parts) >= 3:
+                    source = normalize_entity(parts[0])
+                    relation = parts[1]
+                    target = normalize_entity(parts[2])
+
+                    if is_valid_entity(source) and is_valid_entity(target):
+                        G.add_edge(source, target, label=relation)
+
+    # 🔥 REDUCE GRAPH DENSITY
+    if len(G.nodes) > 80:
+        degree_threshold = 2
+        remove_nodes = [n for n in G.nodes if G.degree(n) <= degree_threshold]
+        G.remove_nodes_from(remove_nodes)
+
+    # 🔥 HARD LIMIT
+    if len(G.nodes) > 100:
+        print("Reducing graph size...")
+        G = nx.Graph(list(G.edges)[:100])
+
+    return G
+
+
+# ==============================
+# COMMUNITY DETECTION
+# ==============================
+def detect_communities(graph):
+    communities = []
+
+    for component in nx.connected_components(graph):
+        subgraph = graph.subgraph(component)
+
+        if len(subgraph.nodes) > 1:
+            try:
+                result = algorithms.leiden(subgraph)
+                for c in result.communities:
+                    communities.append(list(c))
+            except:
+                communities.append(list(subgraph.nodes))
+        else:
+            communities.append(list(subgraph.nodes))
+
+    print("\nCommunities:", communities)
+    return communities
+
+
+# ==============================
+# SUMMARIZE COMMUNITIES (FIXED)
+# ==============================
+def summarize_communities(communities, graph):
+    summaries = []
+
+    for i, community in enumerate(communities):
+        print(f"Community {i}")
+
+        subgraph = graph.subgraph(community)
+        nodes = list(subgraph.nodes)
+        edges = list(subgraph.edges(data=True))
+
+        description = "Entities: " + ", ".join(nodes) + "\nRelationships: "
+
+        rels = []
+        for e in edges:
+            relation = e[2].get("label", "related_to")  # ✅ SAFE FIX
+            rels.append(f"{e[0]} -> {relation} -> {e[1]}")
+
+        description += ", ".join(rels)
+
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "Summarize clearly."},
+                {"role": "user", "content": description}
+            ]
+        )
+
+        summaries.append(response.choices[0].message.content)
+
+    return summaries
+
+
+# ==============================
+# FINAL ANSWER
+# ==============================
+def generate_answers_from_communities(community_summaries, query):
+    answers = []
+
+    for summary in community_summaries:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "Answer based on summary."},
+                {"role": "user", "content": f"{query}\n{summary}"}
+            ]
+        )
+        answers.append(response.choices[0].message.content)
+
+    final = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "Combine into final answer."},
+            {"role": "user", "content": str(answers)}
+        ]
+    )
+
+    return final.choices[0].message.content
+
+
+# ==============================
+# PIPELINE
+# ==============================
+def graph_rag_pipeline(documents, query):
+    chunks = split_documents_into_chunks(documents)
+
+    elements = extract_elements_from_chunks(chunks)
+
+    graph = build_graph_from_summaries(elements)
+
+    print("\nGraph Nodes:", len(graph.nodes))
+    print("Graph Edges:", len(graph.edges))
+
+    communities = detect_communities(graph)
+
+    summaries = summarize_communities(communities, graph)
+
+    final_answer = generate_answers_from_communities(summaries, query)
+
+    return final_answer
+
+
+# ==============================
+# RUN
+# ==============================
+query = "What are the main themes in these documents?"
+
+print("Query:", query)
+
+answer = graph_rag_pipeline(DOCUMENTS, query)
+
+print("\nFINAL ANSWER:\n", answer
+
 
