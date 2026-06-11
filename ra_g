@@ -291,4 +291,8 @@ answer = graph_rag_pipeline(DOCUMENTS, query)
 
 print("\nFINAL ANSWER:\n", answer
 
+api key:- AZURE_OPENAI_API_KEY=6aEbW8856zX7ihekhoyAPC1ddfWllsJdkYS7pDqRRXrma3aCfWrUJQQJ99BJACYeBjFXJ3w3AAABACOGo80z
+AZURE_OPENAI_ENDPOINT=https://prafulaipoc.openai.azure.com/
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4o-mini
 
