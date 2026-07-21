@@ -1,0 +1,127 @@
+# ==========================================================
+# Stage 5 : Hyperlink Extraction
+# Cell 7 : Extract XML Hyperlinks (generic · 20k-safe)
+# ==========================================================
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType
+
+print("=" * 80)
+print("HYPERLINK EXTRACTION")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Normalize XML Reference  (same logic as yours)
+# ----------------------------------------------------------
+def normalize_reference(ref):
+    if not ref:
+        return None
+    ref = ref.strip()
+    if "||" in ref:
+        ref = ref.split("||")[0]
+    if "#" in ref:
+        ref = ref.split("#")[0]
+    ref = ref.replace("&amp;", "&")
+    ref = re.sub(r"\s+", "", ref)      # refs have no spaces
+    return ref.strip()
+
+# ----------------------------------------------------------
+# Parse one [[...]] match -> (link_type, target_reference)
+# Handles doc:wiki: , doc: , AND bare Temp_Import (your data has all 3)
+# ----------------------------------------------------------
+def parse_target(target):
+    if not target:
+        return None
+    target = target.strip()
+
+    if target.startswith("doc:wiki:"):
+        return ("doc:wiki", normalize_reference(target[len("doc:wiki:"):]))
+
+    if target.startswith("doc:Temp_Import"):
+        return ("doc:Temp_Import", normalize_reference(target[len("doc:"):]))
+
+    # BARE form: [[Label>>Temp_Import.<...>.WebHome]] (no doc: prefix)
+    if target.startswith("Temp_Import"):
+        return ("bare:Temp_Import", normalize_reference(target))
+
+    return None
+
+# ----------------------------------------------------------
+# UDF: extract all links from one document's content.
+# Runs in EXECUTORS (distributed) — no toLocalIterator, no driver list.
+# Returns array of structs.
+# ----------------------------------------------------------
+link_schema = ArrayType(StructType([
+    StructField("display_text",     StringType()),
+    StructField("target_reference", StringType()),
+    StructField("link_type",        StringType()),
+]))
+
+BRACKET_RE = re.compile(r"\[\[(.*?)\]\]")
+
+def extract_links(content):
+    if not content:
+        return []
+    out, seen = [], set()
+    for match in BRACKET_RE.findall(content):
+        if ">>" in match:
+            display_text, target = match.split(">>", 1)
+        else:
+            display_text, target = match, match
+        display_text = display_text.strip()
+        parsed = parse_target(target)
+        if parsed is None:
+            continue
+        link_type, target_reference = parsed
+        if not target_reference:
+            continue
+        key = (target_reference, display_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((display_text, target_reference, link_type))
+    return out
+
+extract_links_udf = F.udf(extract_links, link_schema)
+
+# ----------------------------------------------------------
+# Apply distributed, then explode to one row per link
+# ----------------------------------------------------------
+hyperlinks_df = (
+    knowledge_nodes
+    .select(
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("node_content"),                 # kept for Cell 8 sentence matching
+    )
+    .withColumn("_links", extract_links_udf(F.col("node_content")))
+    .withColumn("_link", F.explode_outer("_links"))
+    .filter(F.col("_link").isNotNull())
+    .select(
+        "source_node",
+        "source_title",
+        "node_content",
+        F.col("_link.display_text").alias("display_text"),
+        F.col("_link.target_reference").alias("target_reference"),
+        F.col("_link.link_type").alias("link_type"),
+    )
+    .cache()
+)
+
+# ----------------------------------------------------------
+# Summary
+# ----------------------------------------------------------
+total_links = hyperlinks_df.count()
+
+print()
+print("=" * 80)
+print("HYPERLINK SUMMARY")
+print("=" * 80)
+print(f"Knowledge Nodes : {knowledge_nodes.count()}")
+print(f"Hyperlinks      : {total_links}")
+print("(Passed to cell 8 for sentence matching)")
+print()
+print("Link types found:")
+display(hyperlinks_df.groupBy("link_type").count().orderBy(F.desc("count")))
+print()
+display(hyperlinks_df.select("source_title", "target_reference", "display_text", "link_type").limit(10))
