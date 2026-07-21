@@ -1,0 +1,139 @@
+# ==========================================================
+# Stage 12 : GraphRAG Online Phase (Retriever)
+# Cell 16 : Query Understanding + Traversal + Top-K Ranking
+# ==========================================================
+import re
+
+print("=" * 80)
+print("GRAPHRAG RETRIEVER")
+print("=" * 80)
+
+USER_QUERY = "How can a new Test Environment be created in the application?"
+TOP_K = 10
+print(f"User Query: {USER_QUERY}\n")
+
+STOPWORDS = {"how","can","a","an","new","be","created","create","in","the","what",
+             "is","of","to","and","for","on","it","does","typically","why","are",
+             "with","this","that","from","by","as","at","or","we","i","you"}
+
+def get_keywords(text):
+    return set(re.findall(r'[a-z0-9]+', str(text).lower())) - STOPWORDS
+
+query_keywords = get_keywords(USER_QUERY)
+print(f"Query keywords: {query_keywords}\n")
+
+# ----------------------------------------------------------
+# 1. Find start nodes — match against title AND content
+# ----------------------------------------------------------
+node_scores = []
+for node, attr in KG.nodes(data=True):
+    title   = attr.get("title", "") or ""
+    content = attr.get("content", "") or ""
+    # title matches weigh more than content matches
+    t_overlap = len(query_keywords & get_keywords(title))
+    c_overlap = len(query_keywords & get_keywords(content[:2000]))  # cap for speed
+    score = t_overlap * 3 + c_overlap
+    if score > 0:
+        node_scores.append((node, title, score))
+
+node_scores.sort(key=lambda x: x[2], reverse=True)
+start_nodes = [n[0] for n in node_scores[:3]]
+
+print(f"Start nodes: {len(start_nodes)}")
+for n, t, s in node_scores[:3]:
+    print(f"  - {t}  (score={s})")
+print()
+
+# ----------------------------------------------------------
+# 2. Traversal — collect nodes with hop distance
+#    follows BOTH directions (successors + predecessors)
+# ----------------------------------------------------------
+def neighbors_both(node):
+    return set(KG.successors(node)) | set(KG.predecessors(node))
+
+collected = {}     # node -> best (smallest) hop distance
+retrieved_edges = []
+visited_edges = set()
+
+def explore(frontier, hop):
+    nxt = set()
+    for cur in frontier:
+        for nb in neighbors_both(cur):
+            # record edge (MultiDiGraph-safe: pull predicate from any parallel edge)
+            for a, b in [(cur, nb), (nb, cur)]:
+                if KG.has_edge(a, b):
+                    ekey = (a, b)
+                    if ekey not in visited_edges:
+                        visited_edges.add(ekey)
+                        ed = KG.get_edge_data(a, b)
+                        # MultiDiGraph -> dict-of-dicts; take first parallel edge
+                        first = ed[list(ed.keys())[0]] if ed else {}
+                        retrieved_edges.append((a, b, first))
+            if nb not in collected:
+                collected[nb] = hop
+                nxt.add(nb)
+    return nxt
+
+# seed start nodes at hop 0
+for s in start_nodes:
+    collected[s] = 0
+
+frontier = set(start_nodes)
+frontier = explore(frontier, 1)                 # hop 1
+frontier = explore(frontier, 2)                 # hop 2
+if len(retrieved_edges) < 5:                     # fallback hop 3
+    print("[expanding to hop 3 — sparse context]\n")
+    explore(frontier, 3)
+
+print(f"Traversal: {len(collected)} nodes, {len(retrieved_edges)} edges\n")
+
+# ----------------------------------------------------------
+# 3. Rank collected nodes -> TOP-K documents
+#    score = keyword relevance + closeness (fewer hops) + degree
+# ----------------------------------------------------------
+def node_relevance(node):
+    a = KG.nodes[node]
+    kw = len(query_keywords & get_keywords((a.get("title","") or "") + " " +
+                                           (a.get("content","") or "")[:2000]))
+    hop = collected.get(node, 99)
+    deg = a.get("degree", KG.degree(node))
+    # closer hops and more keyword hits score higher; degree is a small boost
+    return kw * 5 + (3 - min(hop, 3)) * 2 + deg * 0.1
+
+ranked = sorted(collected.keys(), key=node_relevance, reverse=True)
+
+# only return docs that actually have content (skip shell nodes)
+candidates = []
+for node in ranked:
+    a = KG.nodes[node]
+    if a.get("content"):                         # has real content
+        candidates.append({
+            "doc_id": node,
+            "title": a.get("title", node),
+            "reference": node,
+            "content": a.get("content", ""),
+            "hop": collected.get(node, 99),
+            "score": round(node_relevance(node), 2),
+        })
+    if len(candidates) >= TOP_K:
+        break
+
+# ----------------------------------------------------------
+# 4. Display top-K
+# ----------------------------------------------------------
+print("=" * 80)
+print(f"TOP {TOP_K} RETRIEVED DOCUMENTS")
+print("=" * 80)
+if not candidates:
+    print("No content-bearing documents found for this query.")
+for rank, c in enumerate(candidates, 1):
+    print(f"\n{'-'*80}")
+    print(f" Rank      : {rank}")
+    print(f" Title     : {c['title']}")
+    print(f" Reference : {c['reference']}")
+    print(f" Hop       : {c['hop']}")
+    print(f" Score     : {c['score']}")
+    print(f" Content   : {c['content'][:300]}...")
+
+print(f"\n{'='*80}")
+print(f"Total retrieved: {len(candidates)} documents")
