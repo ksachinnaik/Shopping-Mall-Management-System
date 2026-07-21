@@ -1,0 +1,94 @@
+# ==========================================================
+# Stage 4 : Knowledge Node Creation
+# Cell 6 : Create One Node per XML  (deterministic + normalized)
+# ==========================================================
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+
+print("=" * 80)
+print("KNOWLEDGE NODE CREATION")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Input from Cell 5
+# ----------------------------------------------------------
+node_df = xml_df
+print(f"XML Documents (raw) : {node_df.count()}")
+
+# ----------------------------------------------------------
+# Reference normalization
+# MUST be identical to the normalization used in Cell 7
+# (hyperlink extraction). If these diverge -> orphan edges.
+# ----------------------------------------------------------
+def normalize_ref_col(c):
+    c = F.trim(c)
+    # strip a leading "xwiki:" if present in some refs
+    c = F.regexp_replace(c, r"^xwiki:", "")
+    # collapse internal whitespace (rare but happens in exports)
+    c = F.regexp_replace(c, r"\s+", "")
+    return c
+
+# ----------------------------------------------------------
+# Build base node projection
+# ----------------------------------------------------------
+base = (
+    node_df
+    .select(
+        F.col("reference").alias("node_id"),
+        F.col("title").alias("node_name"),
+        F.col("content").alias("node_content"),
+        F.col("doc_id"),
+        F.col("source"),
+        F.col("version"),
+        F.col("content_update_date"),
+        F.col("content_author"),
+    )
+    .withColumn("node_id", normalize_ref_col(F.col("node_id")))
+    # length used both for dedup ranking and content flag
+    .withColumn(
+        "content_len",
+        F.length(F.coalesce(F.col("node_content"), F.lit("")))
+    )
+)
+
+# ----------------------------------------------------------
+# Deterministic dedup:
+# per node_id keep the row with the most content,
+# tie-break on newest update date.
+# ----------------------------------------------------------
+w = (
+    Window
+    .partitionBy("node_id")
+    .orderBy(
+        F.col("content_len").desc_nulls_last(),
+        F.col("content_update_date").desc_nulls_last(),
+    )
+)
+
+knowledge_nodes = (
+    base
+    .withColumn("_rk", F.row_number().over(w))
+    .filter(F.col("_rk") == 1)
+    .drop("_rk")
+    # flag stub / empty-content nodes (valid as link targets,
+    # but retriever should not treat them as answer-bearing)
+    .withColumn("has_content", F.col("content_len") > 0)
+    .cache()
+)
+
+# ----------------------------------------------------------
+# Node Statistics
+# ----------------------------------------------------------
+total_nodes    = knowledge_nodes.count()   # materializes cache
+n_with_content = knowledge_nodes.filter(F.col("has_content")).count()
+n_stub         = total_nodes - n_with_content
+
+print()
+print("=" * 80)
+print("KNOWLEDGE NODES")
+print("=" * 80)
+print(f"Total Nodes Created : {total_nodes}")
+print(f"With Content        : {n_with_content}")
+print(f"Stub / Empty        : {n_stub}")
+print()
+display(knowledge_nodes)
