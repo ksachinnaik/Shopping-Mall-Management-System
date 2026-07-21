@@ -1,0 +1,125 @@
+# ==========================================================
+# Stage 13 : MLflow Evaluation
+# Cell 21 : Evaluate GraphRAG against the eval set
+# ==========================================================
+import mlflow
+import pandas as pd
+import re
+
+print("=" * 80)
+print("EVALUATING GRAPHRAG WITH MLFLOW")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Use the real eval set (not a single hardcoded query).
+# Limit to a sample for a quick run; raise N for a fuller eval.
+# ----------------------------------------------------------
+N_EVAL = 10
+eval_pdf = (
+    top50_eval                       # from Cell 3 (has ground_truth etc.)
+    .select("request", "ground_truth", "expected_facts")
+    .limit(N_EVAL)
+    .toPandas()
+)
+print(f"Evaluating {len(eval_pdf)} questions\n")
+
+# ----------------------------------------------------------
+# MultiDiGraph-safe predicate access
+# ----------------------------------------------------------
+def edge_predicate(u, v):
+    ed = KG.get_edge_data(u, v)
+    if not ed:
+        return "related to"
+    first = ed[list(ed.keys())[0]]          # unwrap parallel-edge dict
+    return str(first.get("predicate", "related to")).replace("_", " ")
+
+# ----------------------------------------------------------
+# Full pipeline per question (retriever + context + LLM)
+# ----------------------------------------------------------
+def evaluate_graphrag_pipeline(row):
+    question = row["request"]
+    q_keywords = get_keywords(question)
+
+    # A. retriever — score by title + content
+    scores = []
+    for n, attr in KG.nodes(data=True):
+        if not attr.get("content"):
+            continue
+        title_kws   = get_keywords(attr.get("title", ""))
+        content_kws = get_keywords((attr.get("content", "") or "")[:2000])
+        overlap = len(q_keywords & title_kws) * 5 + len(q_keywords & content_kws)
+        if overlap > 0:
+            scores.append((n, overlap))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    start_nodes = [s[0] for s in scores[:3]]
+
+    # traversal (1-hop, both directions)
+    retrieved_edges, visited = [], set()
+    for cur in start_nodes:
+        for nb in set(KG.successors(cur)) | set(KG.predecessors(cur)):
+            if (cur, nb) not in visited and KG.has_edge(cur, nb):
+                visited.add((cur, nb))
+                retrieved_edges.append((cur, nb))
+
+    # B. context builder
+    context_chunks = []
+    for n in start_nodes:
+        title = str(KG.nodes[n].get("title", n))
+        raw   = str(KG.nodes[n].get("content", "") or "")
+        if raw:
+            clean = raw[:1500] + "... [truncated]"
+            context_chunks.append({
+                "doc_uri": f"{n}_raw",
+                "content": f"DOCUMENT TITLE: {title}\nDOCUMENT CONTENT:\n{clean}",
+            })
+
+    edge_lines = []
+    for u, v in retrieved_edges[:10]:
+        src = str(KG.nodes[u].get("title", u))
+        tgt = str(KG.nodes[v].get("title", v))
+        if "doc:" in tgt or "WebHome" in tgt:
+            tgt = re.sub(r'[^a-zA-Z\s]', ' ', tgt.split(".")[-1].replace("WebHome","")).strip() or "an external document"
+        fact = f"{src} {edge_predicate(u, v)} {tgt}."
+        edge_lines.append(fact)
+        context_chunks.append({"doc_uri": f"{u}_to_{v}", "content": fact})
+
+    full_node_context  = "\n".join(c["content"] for c in context_chunks if "DOCUMENT CONTENT" in c["content"])
+    graph_edge_context = "\n".join(edge_lines)
+
+    # C. LLM answer
+    final_prompt = (f"Question:\n{question}\n\n"
+                    f"RAW DOCUMENT TEXT:\n{full_node_context}\n\n"
+                    f"GRAPH RELATIONSHIPS:\n{graph_edge_context}")
+    try:
+        resp = llm.invoke([("system", SYSTEM_PROMPT), ("human", final_prompt)])
+        llm_response = resp.content.strip()
+    except Exception as e:
+        llm_response = f"Error calling LLM: {e}"
+
+    return pd.Series({"retrieved_context": context_chunks, "response": llm_response})
+
+results_pdf = eval_pdf.apply(evaluate_graphrag_pipeline, axis=1)
+eval_df_final = pd.concat([eval_pdf, results_pdf], axis=1)
+
+# ----------------------------------------------------------
+# MLflow evaluation (with ground truth for correctness)
+# ----------------------------------------------------------
+print("\nStarting MLflow run...")
+with mlflow.start_run(run_name="GraphRAG_Evaluation"):
+    eval_data = eval_df_final.rename(columns={
+        "request": "request",
+        "response": "response",
+        "retrieved_context": "retrieved_context",
+        "ground_truth": "expected_response",   # judge uses this for correctness
+    }).to_dict(orient="records")
+
+    try:
+        results = mlflow.evaluate(
+            data=eval_data,
+            model_type="databricks-agent",
+        )
+        display(results.tables["eval_results"])
+    except Exception as e:
+        print(f"MLflow Evaluation Failed: {e}")
+        print("If this is a version/metric error, tell me your mlflow version "
+              "and I'll match the API.")
