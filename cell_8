@@ -17,10 +17,10 @@ def split_into_sentences(content):
     if not content:
         return []
     content = re.sub(r'\{\{code\}\}.*?\{\{/code\}\}', ' ', content, flags=re.DOTALL)
-    content = re.sub(r'\{\{[^}]*?\}\}', ' ', content)        # FIX: [^}] not [^\]]
-    content = re.sub(r'\(\%.*?\%\)', ' ', content)
-    content = re.sub(r'==+', '.', content)
-    content = re.sub(r'\\\\', ' ', content)
+    content = re.sub(r'\{\{[^}]*?\}\}', ' ', content)        # macros
+    content = re.sub(r'\(\%.*?\%\)', ' ', content)           # style annotations
+    content = re.sub(r'==+', '.', content)                   # headers -> boundary
+    content = re.sub(r'\\\\', ' ', content)                  # wiki line breaks
     sentences = re.split(r'(?<=[.!?])\s+', content)
     return [s.strip() for s in sentences if s and len(s.strip()) > 10]
 
@@ -38,8 +38,7 @@ def clean_sentence(sentence):
     return s
 
 # ----------------------------------------------------------
-# parse_target: redefine here so the UDF is self-contained
-# (executors don't reliably see Cell 7's function)
+# parse_target: self-contained (executors can't see Cell 7)
 # ----------------------------------------------------------
 def _normalize_reference(ref):
     if not ref:
@@ -99,7 +98,7 @@ def match_sentences(node_id, content):
             link_type, target_reference = parsed
             if not target_reference:
                 continue
-            if target_reference == node_id:          # FIX: drop self-loops
+            if target_reference == node_id:          # drop self-loops
                 continue
             key = (target_reference, cleaned)
             if key in seen:
@@ -120,7 +119,8 @@ sentences_df = (
         F.col("node_name").alias("source_title"),
         F.col("node_content"),
     )
-    .withColumn("_recs", match_sentences_udf(F.col("node_id"), F.col("node_content")))
+    # after the rename above, the column is "source_node", not "node_id"
+    .withColumn("_recs", match_sentences_udf(F.col("source_node"), F.col("node_content")))
     .withColumn("_rec", F.explode_outer("_recs"))
     .filter(F.col("_rec").isNotNull())
     .select(
