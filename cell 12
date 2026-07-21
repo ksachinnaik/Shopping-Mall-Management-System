@@ -1,51 +1,59 @@
 # ==========================================================
-# Cell 12 : Visualize Knowledge Graph (readable static)
+# Cell 12 : Visualize FULL Knowledge Graph (all nodes + edges, readable)
 # ==========================================================
 import matplotlib.pyplot as plt
 import networkx as nx
 
 print("=" * 80)
-print("KNOWLEDGE GRAPH VISUALIZATION")
+print("KNOWLEDGE GRAPH VISUALIZATION (full)")
 print("=" * 80)
-print(f"Full graph : {KG.number_of_nodes()} nodes, {KG.number_of_edges()} edges")
+print(f"Total Nodes : {KG.number_of_nodes()}")
+print(f"Total Edges : {KG.number_of_edges()}")
 
 # ----------------------------------------------------------
-# Draw only nodes that have content (loaded docs) + their edges.
-# Shell nodes (content=None) and isolated nodes are hidden -> readable.
+# Labels: real docs show title; shell nodes (GUIDs) show short id
+# so the outer clusters stop being walls of text
 # ----------------------------------------------------------
-core_nodes = [n for n, d in KG.nodes(data=True) if d.get("content") is not None]
-SUB = KG.subgraph(core_nodes).copy()
+node_labels = {}
+node_colors = []
+node_sizes  = []
+degrees = dict(KG.degree())
 
-# drop isolated nodes within the subgraph
-SUB.remove_nodes_from([n for n in SUB.nodes() if SUB.degree(n) == 0])
+for n, d in KG.nodes(data=True):
+    title = d.get("title") or n
+    if d.get("content") is not None:
+        # loaded doc -> show real title, bigger, orange
+        node_labels[n] = title[:20]
+        node_colors.append("#f4a261")
+        node_sizes.append(500 + degrees[n] * 120)
+    else:
+        # shell node (linked, not loaded) -> tiny, no label, light
+        node_labels[n] = ""                 # hide GUID clutter
+        node_colors.append("#a8dadc")
+        node_sizes.append(60 + degrees[n] * 30)
 
-print(f"Drawing core : {SUB.number_of_nodes()} nodes, {SUB.number_of_edges()} edges")
+# ----------------------------------------------------------
+# Layout: more spread. k larger = nodes push apart harder.
+# iterations higher = cleaner separation (slower).
+# ----------------------------------------------------------
+plt.figure(figsize=(26, 18))
+pos = nx.spring_layout(KG, seed=42, k=3.0, iterations=200)
 
-if SUB.number_of_nodes() == 0:
-    print("No connected core nodes to draw.")
-else:
-    node_labels = {n: (d.get("title") or n)[:22] for n, d in SUB.nodes(data=True)}
-    edge_labels = {(u, v): d.get("predicate", "") for u, v, d in SUB.edges(data=True)}
+nx.draw_networkx_nodes(KG, pos, node_size=node_sizes,
+                       node_color=node_colors, edgecolors="black", linewidths=0.4)
 
-    # size nodes by degree so hubs stand out
-    degrees = dict(SUB.degree())
-    node_sizes = [300 + degrees[n] * 250 for n in SUB.nodes()]
+nx.draw_networkx_edges(KG, pos, arrows=True, arrowsize=8,
+                       width=0.4, edge_color="gray", alpha=0.35,
+                       connectionstyle="arc3,rad=0.06")
 
-    plt.figure(figsize=(20, 14))
-    pos = nx.spring_layout(SUB, seed=42, k=2.5 / (SUB.number_of_nodes() ** 0.5))
+# only label the real docs (shell labels are "")
+nx.draw_networkx_labels(KG, pos, labels=node_labels,
+                        font_size=7, font_weight="bold")
 
-    nx.draw_networkx_nodes(SUB, pos, node_size=node_sizes,
-                           node_color="skyblue", edgecolors="black", linewidths=1)
-    nx.draw_networkx_labels(SUB, pos, labels=node_labels, font_size=8)
-    nx.draw_networkx_edges(SUB, pos, arrows=True, arrowsize=12,
-                           width=1, edge_color="gray", alpha=0.6,
-                           connectionstyle="arc3,rad=0.08")
-    nx.draw_networkx_edge_labels(SUB, pos, edge_labels=edge_labels,
-                                 font_size=6, rotate=False,
-                                 bbox=dict(boxstyle="round,pad=0.1",
-                                           fc="white", ec="none", alpha=0.7))
-    plt.title("Semantic Knowledge Graph (connected core)",
-              fontsize=16, fontweight="bold")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.show()
+plt.title("Semantic Knowledge Graph — all nodes & edges",
+          fontsize=18, fontweight="bold")
+plt.axis("off")
+plt.tight_layout()
+plt.savefig("knowledge_graph_full.png", dpi=200, bbox_inches="tight")
+plt.show()
+print("Saved high-res: knowledge_graph_full.png")
