@@ -1,59 +1,88 @@
 # ==========================================================
-# Cell 12 : Visualize FULL Knowledge Graph (all nodes + edges, readable)
+# Cell 12 : Knowledge Graph — Clean Visualization
 # ==========================================================
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import networkx as nx
 
 print("=" * 80)
-print("KNOWLEDGE GRAPH VISUALIZATION (full)")
+print("KNOWLEDGE GRAPH — CLEAN VIEW")
 print("=" * 80)
-print(f"Total Nodes : {KG.number_of_nodes()}")
-print(f"Total Edges : {KG.number_of_edges()}")
 
 # ----------------------------------------------------------
-# Labels: real docs show title; shell nodes (GUIDs) show short id
-# so the outer clusters stop being walls of text
+# Build the readable core: relationships between LOADED docs.
+# (predicate labels are only legible on the core, not on 201 nodes)
 # ----------------------------------------------------------
-node_labels = {}
-node_colors = []
-node_sizes  = []
-degrees = dict(KG.degree())
+loaded = {n for n, d in KG.nodes(data=True) if d.get("content") is not None}
 
-for n, d in KG.nodes(data=True):
-    title = d.get("title") or n
-    if d.get("content") is not None:
-        # loaded doc -> show real title, bigger, orange
-        node_labels[n] = title[:20]
-        node_colors.append("#f4a261")
-        node_sizes.append(500 + degrees[n] * 120)
-    else:
-        # shell node (linked, not loaded) -> tiny, no label, light
-        node_labels[n] = ""                 # hide GUID clutter
-        node_colors.append("#a8dadc")
-        node_sizes.append(60 + degrees[n] * 30)
+CORE = nx.MultiDiGraph()
+for n in loaded:
+    CORE.add_node(n, **KG.nodes[n])
+for u, v, d in KG.edges(data=True):
+    if u in loaded and v in loaded:
+        CORE.add_edge(u, v, **d)
+CORE.remove_nodes_from([n for n in list(CORE.nodes()) if CORE.degree(n) == 0])
+
+print(f"Nodes shown : {CORE.number_of_nodes()}")
+print(f"Edges shown : {CORE.number_of_edges()}")
 
 # ----------------------------------------------------------
-# Layout: more spread. k larger = nodes push apart harder.
-# iterations higher = cleaner separation (slower).
+# Assign a distinct color to each predicate type
 # ----------------------------------------------------------
-plt.figure(figsize=(26, 18))
-pos = nx.spring_layout(KG, seed=42, k=3.0, iterations=200)
+predicates = sorted({d.get("predicate", "related_to") for _, _, d in CORE.edges(data=True)})
+palette = plt.cm.tab20.colors
+pred_color = {p: palette[i % len(palette)] for i, p in enumerate(predicates)}
 
-nx.draw_networkx_nodes(KG, pos, node_size=node_sizes,
-                       node_color=node_colors, edgecolors="black", linewidths=0.4)
+# ----------------------------------------------------------
+# Layout + sizing
+# ----------------------------------------------------------
+degrees = dict(CORE.degree())
+node_sizes = [700 + degrees[n] * 260 for n in CORE.nodes()]
+node_labels = {n: (d.get("title") or n)[:18] for n, d in CORE.nodes(data=True)}
 
-nx.draw_networkx_edges(KG, pos, arrows=True, arrowsize=8,
-                       width=0.4, edge_color="gray", alpha=0.35,
-                       connectionstyle="arc3,rad=0.06")
+plt.figure(figsize=(20, 15))
+ax = plt.gca()
+pos = nx.spring_layout(CORE, seed=42, k=3.5, iterations=300)
 
-# only label the real docs (shell labels are "")
-nx.draw_networkx_labels(KG, pos, labels=node_labels,
-                        font_size=7, font_weight="bold")
+# nodes
+nx.draw_networkx_nodes(
+    CORE, pos, node_size=node_sizes,
+    node_color="#2a9d8f", edgecolors="#1d3557", linewidths=1.5, alpha=0.95,
+)
+nx.draw_networkx_labels(
+    CORE, pos, labels=node_labels,
+    font_size=9, font_weight="bold", font_color="white",
+)
 
-plt.title("Semantic Knowledge Graph — all nodes & edges",
-          fontsize=18, fontweight="bold")
+# edges colored by predicate
+for u, v, d in CORE.edges(data=True):
+    p = d.get("predicate", "related_to")
+    nx.draw_networkx_edges(
+        CORE, pos, edgelist=[(u, v)],
+        edge_color=[pred_color[p]], width=2.0, alpha=0.75,
+        arrows=True, arrowsize=16,
+        connectionstyle="arc3,rad=0.12",
+    )
+
+# edge labels (predicate text, small, boxed)
+edge_labels = {(u, v): d.get("predicate", "") for u, v, d in CORE.edges(data=True)}
+nx.draw_networkx_edge_labels(
+    CORE, pos, edge_labels=edge_labels,
+    font_size=7, font_color="#333333", rotate=False,
+    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
+)
+
+# legend: predicate -> color
+legend_handles = [mpatches.Patch(color=pred_color[p], label=p) for p in predicates]
+ax.legend(
+    handles=legend_handles, title="Relationship (predicate)",
+    loc="upper left", bbox_to_anchor=(1.01, 1.0),
+    fontsize=9, title_fontsize=11, frameon=True,
+)
+
+plt.title("Semantic Knowledge Graph", fontsize=20, fontweight="bold", color="#1d3557", pad=20)
 plt.axis("off")
 plt.tight_layout()
-plt.savefig("knowledge_graph_full.png", dpi=200, bbox_inches="tight")
+plt.savefig("kg_clean.png", dpi=220, bbox_inches="tight", facecolor="white")
 plt.show()
-print("Saved high-res: knowledge_graph_full.png")
+print("Saved: kg_clean.png")
