@@ -1,0 +1,76 @@
+# ==========================================================
+# Stage 8 : RDF Triple Generation
+# Cell 10 : Convert Semantic Records to Unique RDF Triples
+# ==========================================================
+from pyspark.sql import functions as F
+
+print("=" * 80)
+print("RDF TRIPLE GENERATION (Cell 10)")
+print("=" * 80)
+
+# predicates that are NOT real relationships -> exclude from graph
+NON_SEMANTIC = ["extraction_failed"]     # keep 'related_to' (weak but real)
+
+validated_rdf_df = (
+    rdf_df
+    # 1. Skip incomplete triples
+    .filter(
+        F.col("subject_id").isNotNull() & (F.col("subject_id") != "") &
+        F.col("predicate").isNotNull()  & (F.col("predicate")  != "") &
+        F.col("object_id").isNotNull()  & (F.col("object_id")  != "")
+    )
+    # 2. Drop failed extractions (LLM errors, not real edges)
+    .filter(~F.col("predicate").isin(NON_SEMANTIC))
+    # 3. Skip self-loops
+    .filter(F.col("subject_id") != F.col("object_id"))
+    # 4. Deduplicate on the RDF triple key
+    .dropDuplicates(["subject_id", "predicate", "object_id"])
+    # 5. Reference-based subject/object; titles for display
+    .select(
+        F.col("subject_id").alias("subject"),         # XML reference (node key)
+        F.col("predicate"),
+        F.col("object_id").alias("object"),           # XML reference (node key)
+        F.col("subject").alias("subject_title"),      # display title
+        F.col("object").alias("object_title"),        # display title
+        F.col("sentence"),
+        F.col("link_type"),
+    )
+    .cache()
+)
+
+# ----------------------------------------------------------
+# Summary
+# ----------------------------------------------------------
+output_count = validated_rdf_df.count()      # materializes cache
+input_count  = rdf_df.count()                # cached from Cell 9
+
+predicate_distribution = (
+    validated_rdf_df.groupBy("predicate").count().orderBy(F.desc("count"))
+)
+
+print()
+print("=" * 80)
+print("RDF TRIPLE SUMMARY")
+print("=" * 80)
+print(f"Semantic Records (input) : {input_count}")
+print(f"Unique RDF Triples       : {output_count}")
+print(f"Dropped (failed/self/dup): {input_count - output_count}")
+print()
+print("-" * 80)
+print("PREDICATE DISTRIBUTION")
+print("-" * 80)
+for row in predicate_distribution.collect():
+    print(f"{row['predicate']:<25} : {row['count']}")
+
+print()
+print("-" * 80)
+print("SAMPLE RDF TRIPLES (reference-based)")
+print("-" * 80)
+for row in validated_rdf_df.limit(10).collect():
+    print(f" Subject   : {row['subject']}")
+    print(f" Predicate : {row['predicate']}")
+    print(f" Object    : {row['object']}")
+    print(f" Display   : ({row['subject_title']}, {row['predicate']}, {row['object_title']})")
+    print()
+
+display(validated_rdf_df)
