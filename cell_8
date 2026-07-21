@@ -1,0 +1,150 @@
+# ==========================================================
+# Stage 6 : Sentence Matching
+# Cell 8 : Locate Sentence Containing Each Hyperlink (20k-safe)
+# ==========================================================
+import re
+from pyspark.sql import functions as F
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType
+
+print("=" * 80)
+print("SENTENCE MATCHING (Cell 8)")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# Split content into sentences
+# ----------------------------------------------------------
+def split_into_sentences(content):
+    if not content:
+        return []
+    content = re.sub(r'\{\{code\}\}.*?\{\{/code\}\}', ' ', content, flags=re.DOTALL)
+    content = re.sub(r'\{\{[^}]*?\}\}', ' ', content)        # FIX: [^}] not [^\]]
+    content = re.sub(r'\(\%.*?\%\)', ' ', content)
+    content = re.sub(r'==+', '.', content)
+    content = re.sub(r'\\\\', ' ', content)
+    sentences = re.split(r'(?<=[.!?])\s+', content)
+    return [s.strip() for s in sentences if s and len(s.strip()) > 10]
+
+# ----------------------------------------------------------
+# Clean wiki markup from a sentence
+# ----------------------------------------------------------
+def clean_sentence(sentence):
+    s = re.sub(r'\[\[(.*?)\>\>.*?\]\]', r'\1', sentence)     # [[Display>>Target]] -> Display
+    s = re.sub(r'\[\[(.*?)\]\]', r'\1', s)                   # [[X]] -> X
+    s = re.sub(r'\|\|[^\s]*', '', s)                         # drop ||anchor
+    s = s.replace('(((', '').replace(')))', '')
+    s = s.replace('**', '').replace('*', '')
+    s = re.sub(r'\(\s*\)', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+# ----------------------------------------------------------
+# parse_target: redefine here so the UDF is self-contained
+# (executors don't reliably see Cell 7's function)
+# ----------------------------------------------------------
+def _normalize_reference(ref):
+    if not ref:
+        return None
+    ref = ref.strip()
+    if "||" in ref:
+        ref = ref.split("||")[0]
+    if "#" in ref:
+        ref = ref.split("#")[0]
+    ref = ref.replace("&amp;", "&")
+    ref = re.sub(r"\s+", "", ref)
+    return ref.strip()
+
+def _parse_target(target):
+    if not target:
+        return None
+    target = target.strip()
+    if target.startswith("doc:wiki:"):
+        return ("doc:wiki", _normalize_reference(target[len("doc:wiki:"):]))
+    if target.startswith("doc:Temp_Import"):
+        return ("doc:Temp_Import", _normalize_reference(target[len("doc:"):]))
+    if target.startswith("Temp_Import"):
+        return ("bare:Temp_Import", _normalize_reference(target))
+    return None
+
+# ----------------------------------------------------------
+# UDF: from (node_id, content) -> array of sentence-link records
+# ----------------------------------------------------------
+rec_schema = ArrayType(StructType([
+    StructField("target_reference", StringType()),
+    StructField("display_text",     StringType()),
+    StructField("link_type",        StringType()),
+    StructField("sentence",         StringType()),
+]))
+
+BRACKET_RE = re.compile(r"\[\[(.*?)\]\]")
+
+def match_sentences(node_id, content):
+    if not content:
+        return []
+    out = []
+    for sentence in split_into_sentences(content):
+        matches = BRACKET_RE.findall(sentence)
+        if not matches:
+            continue
+        seen = set()
+        cleaned = clean_sentence(sentence)
+        for raw in matches:
+            if ">>" in raw:
+                display_text, target = raw.split(">>", 1)
+            else:
+                display_text, target = raw, raw
+            display_text = display_text.strip()
+            parsed = _parse_target(target)
+            if parsed is None:
+                continue
+            link_type, target_reference = parsed
+            if not target_reference:
+                continue
+            if target_reference == node_id:          # FIX: drop self-loops
+                continue
+            key = (target_reference, cleaned)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((target_reference, display_text, link_type, cleaned))
+    return out
+
+match_sentences_udf = F.udf(match_sentences, rec_schema)
+
+# ----------------------------------------------------------
+# Apply distributed + explode
+# ----------------------------------------------------------
+sentences_df = (
+    knowledge_nodes
+    .select(
+        F.col("node_id").alias("source_node"),
+        F.col("node_name").alias("source_title"),
+        F.col("node_content"),
+    )
+    .withColumn("_recs", match_sentences_udf(F.col("node_id"), F.col("node_content")))
+    .withColumn("_rec", F.explode_outer("_recs"))
+    .filter(F.col("_rec").isNotNull())
+    .select(
+        "source_node",
+        "source_title",
+        F.col("_rec.target_reference").alias("target_reference"),
+        F.col("_rec.display_text").alias("display_text"),
+        F.col("_rec.link_type").alias("link_type"),
+        F.col("_rec.sentence").alias("sentence"),
+    )
+    .cache()
+)
+
+# ----------------------------------------------------------
+# Summary
+# ----------------------------------------------------------
+total_recs = sentences_df.count()
+
+print()
+print("=" * 80)
+print("SENTENCE MATCHING SUMMARY")
+print("=" * 80)
+print(f"Knowledge Nodes  : {knowledge_nodes.count()}")
+print(f"Sentence Records : {total_recs}")
+print("(Ready for Cell 9 LLM Semantic Extraction)")
+print()
+display(sentences_df.select("source_title", "target_reference", "display_text", "sentence").limit(10))
