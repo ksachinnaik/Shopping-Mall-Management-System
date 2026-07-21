@@ -1,0 +1,51 @@
+# ==========================================================
+# Cell 12 : Visualize Knowledge Graph (readable static)
+# ==========================================================
+import matplotlib.pyplot as plt
+import networkx as nx
+
+print("=" * 80)
+print("KNOWLEDGE GRAPH VISUALIZATION")
+print("=" * 80)
+print(f"Full graph : {KG.number_of_nodes()} nodes, {KG.number_of_edges()} edges")
+
+# ----------------------------------------------------------
+# Draw only nodes that have content (loaded docs) + their edges.
+# Shell nodes (content=None) and isolated nodes are hidden -> readable.
+# ----------------------------------------------------------
+core_nodes = [n for n, d in KG.nodes(data=True) if d.get("content") is not None]
+SUB = KG.subgraph(core_nodes).copy()
+
+# drop isolated nodes within the subgraph
+SUB.remove_nodes_from([n for n in SUB.nodes() if SUB.degree(n) == 0])
+
+print(f"Drawing core : {SUB.number_of_nodes()} nodes, {SUB.number_of_edges()} edges")
+
+if SUB.number_of_nodes() == 0:
+    print("No connected core nodes to draw.")
+else:
+    node_labels = {n: (d.get("title") or n)[:22] for n, d in SUB.nodes(data=True)}
+    edge_labels = {(u, v): d.get("predicate", "") for u, v, d in SUB.edges(data=True)}
+
+    # size nodes by degree so hubs stand out
+    degrees = dict(SUB.degree())
+    node_sizes = [300 + degrees[n] * 250 for n in SUB.nodes()]
+
+    plt.figure(figsize=(20, 14))
+    pos = nx.spring_layout(SUB, seed=42, k=2.5 / (SUB.number_of_nodes() ** 0.5))
+
+    nx.draw_networkx_nodes(SUB, pos, node_size=node_sizes,
+                           node_color="skyblue", edgecolors="black", linewidths=1)
+    nx.draw_networkx_labels(SUB, pos, labels=node_labels, font_size=8)
+    nx.draw_networkx_edges(SUB, pos, arrows=True, arrowsize=12,
+                           width=1, edge_color="gray", alpha=0.6,
+                           connectionstyle="arc3,rad=0.08")
+    nx.draw_networkx_edge_labels(SUB, pos, edge_labels=edge_labels,
+                                 font_size=6, rotate=False,
+                                 bbox=dict(boxstyle="round,pad=0.1",
+                                           fc="white", ec="none", alpha=0.7))
+    plt.title("Semantic Knowledge Graph (connected core)",
+              fontsize=16, fontweight="bold")
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
