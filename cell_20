@@ -1,0 +1,74 @@
+# ==========================================================
+# Stage 12 : GraphRAG Online Phase (Retriever)
+# Cell 20 : Generate Answer using LLM
+# ==========================================================
+print("=" * 80)
+print("GRAPHRAG ONLINE: FINAL LLM ANSWER")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# 1. Build context from the top-K retrieved candidates (Cell 18)
+# ----------------------------------------------------------
+USER_QUERY = query.strip()            # from Cell 18
+MAX_CHARS_PER_DOC = 1500              # cap per doc to protect context window
+
+doc_blocks = []
+for c in candidates:
+    content = (c["content"] or "")[:MAX_CHARS_PER_DOC]
+    doc_blocks.append(
+        f"DOCUMENT TITLE: {c['title']}\n"
+        f"REFERENCE: {c['reference']}\n"
+        f"CONTENT:\n{content}"
+    )
+FULL_NODE_CONTEXT = "\n\n".join(doc_blocks) if doc_blocks else ""
+
+# ----------------------------------------------------------
+# 2. System prompt (rules for the LLM)
+# ----------------------------------------------------------
+SYSTEM_PROMPT = """You are an expert technical assistant.
+CRITICAL RULES:
+1. Answer the user's question ONLY using the retrieved document context below. Do NOT use outside training knowledge.
+2. If the context is empty, reply exactly: "The information is unavailable in the Knowledge Graph."
+3. If context IS present, be analytical and synthesize a detailed answer from whatever information is available. Do not just say the exact answer is missing.
+4. Cite the document titles you used where relevant."""
+
+# ----------------------------------------------------------
+# 3. Final prompt (question + retrieved context)
+# ----------------------------------------------------------
+FINAL_PROMPT = f"""
+Question:
+{USER_QUERY}
+---------------------------------------
+RETRIEVED DOCUMENTS:
+{FULL_NODE_CONTEXT}
+"""
+
+print("Context built from", len(candidates), "documents.")
+print("Prompt length:", len(FINAL_PROMPT), "chars")
+print("Sending Knowledge Graph Context to Azure OpenAI...\n")
+
+# ----------------------------------------------------------
+# 4. Call the LLM
+# ----------------------------------------------------------
+if not candidates:
+    print("No documents retrieved — skipping LLM call.")
+else:
+    try:
+        # uses the 'llm' object initialized in your LLM setup cell
+        response = llm.invoke([
+            ("system", SYSTEM_PROMPT),
+            ("human", FINAL_PROMPT)
+        ])
+
+        final_answer = response.content.strip()
+
+        print("-" * 80)
+        print("USER QUESTION:")
+        print(USER_QUERY)
+        print("-" * 80)
+        print("GRAPHRAG ANSWER:")
+        print(final_answer)
+        print("-" * 80)
+
+    except Exception as e:
+        print(f"Error calling LLM: {e}")
