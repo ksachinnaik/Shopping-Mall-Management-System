@@ -1,0 +1,102 @@
+# ==========================================================
+# Stage 9 : Knowledge Graph Construction
+# Cell 11 : Build Knowledge Graph from RDF Triples
+# ==========================================================
+import networkx as nx
+
+print("=" * 80)
+print("KNOWLEDGE GRAPH CONSTRUCTION (Cell 11)")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# 1. Directed graph.
+#    MultiDiGraph keeps parallel edges (A uses B AND A references B).
+#    Use nx.DiGraph() instead if you want at most one edge per pair.
+# ----------------------------------------------------------
+KG = nx.MultiDiGraph()
+
+# ----------------------------------------------------------
+# 2. Add ALL documents as nodes FIRST (so isolated docs survive,
+#    and every node carries title + content + source for retrieval)
+# ----------------------------------------------------------
+print("Adding all knowledge nodes (with content)...")
+all_nodes = knowledge_nodes.select(
+    "node_id", "node_name", "node_content", "source"
+).collect()
+
+for r in all_nodes:
+    KG.add_node(
+        r["node_id"],
+        title=r["node_name"],
+        content=r["node_content"],   # needed by Context Builder (Cell 17)
+        source=r["source"],
+    )
+
+print(f"Base nodes added: {KG.number_of_nodes()}")
+
+# ----------------------------------------------------------
+# 3. Add edges from validated triples
+# ----------------------------------------------------------
+print("Collecting validated RDF triples...")
+validated_triples = validated_rdf_df.collect()
+print("Adding semantic edges...\n")
+
+for row in validated_triples:
+    subj = row["subject"]
+    obj  = row["object"]
+
+    # target may be a doc we didn't load (name/GUID not in node set)
+    # -> add a lightweight node so the edge is valid
+    if subj not in KG:
+        KG.add_node(subj, title=row["subject_title"], content=None, source=None)
+    if obj not in KG:
+        KG.add_node(obj, title=row["object_title"], content=None, source=None)
+
+    KG.add_edge(
+        subj,
+        obj,
+        predicate=row["predicate"],
+        sentence=row["sentence"],
+        link_type=row["link_type"],
+    )
+
+# ----------------------------------------------------------
+# 4. Graph metrics (your retriever notes want degree; add it now)
+# ----------------------------------------------------------
+for n in KG.nodes():
+    KG.nodes[n]["degree"] = KG.degree(n)
+
+# ----------------------------------------------------------
+# 5. Summary
+# ----------------------------------------------------------
+print("=" * 80)
+print("KNOWLEDGE GRAPH SUMMARY")
+print("=" * 80)
+print(f"Total Nodes : {KG.number_of_nodes()}")
+print(f"Total Edges : {KG.number_of_edges()}")
+print(f"Triples in  : {len(validated_triples)}   (edges should match if MultiDiGraph)")
+
+# isolated nodes = docs with no links
+isolated = [n for n in KG.nodes() if KG.degree(n) == 0]
+print(f"Isolated docs (no links): {len(isolated)}")
+
+print()
+print("-" * 80)
+print("SAMPLE NODES (Reference -> Title)")
+print("-" * 80)
+for node, attr in list(KG.nodes(data=True))[:10]:
+    print(f" Node  : {node}")
+    print(f" Title : {attr.get('title', 'N/A')}  | degree={attr.get('degree',0)}\n")
+
+print("-" * 80)
+print("SAMPLE EDGES (Subject --[predicate]--> Object)")
+print("-" * 80)
+for s, t, attr in list(KG.edges(data=True))[:10]:
+    st = KG.nodes[s].get("title", s)
+    tt = KG.nodes[t].get("title", t)
+    print(f" Display  : ({st}) --[{attr.get('predicate','?')}]--> ({tt})")
+    print(f" Internal : ({s}) -> ({t})\n")
+
+print("=" * 80)
+print("Knowledge Graph Successfully Created!")
+print("=" * 80)
