@@ -1,0 +1,73 @@
+# ==========================================================
+# Stage 12 : GraphRAG Online Phase
+# Cell 17 : Context Builder (top-K docs + graph relationships)
+# ==========================================================
+import re
+
+print("=" * 80)
+print("GRAPHRAG CONTEXT BUILDER")
+print("=" * 80)
+
+MAX_CHARS_PER_DOC = 1500      # cap so we don't blow the LLM context window
+
+# ----------------------------------------------------------
+# 1. Document text from the TOP-K retrieved candidates (Cell 16)
+#    (not just start_nodes — this is the GraphRAG payoff)
+# ----------------------------------------------------------
+node_texts = []
+for c in candidates:                      # <-- uses Cell 16's ranked top-10
+    title   = c["title"]
+    content = (c["content"] or "")[:MAX_CHARS_PER_DOC]
+    node_texts.append(
+        f"DOCUMENT TITLE: {title}\n"
+        f"REFERENCE: {c['reference']}\n"
+        f"CONTENT:\n{content}"
+    )
+FULL_NODE_CONTEXT = "\n\n".join(node_texts) if node_texts else ""
+
+# ----------------------------------------------------------
+# 2. Readable graph relationships from traversed edges
+# ----------------------------------------------------------
+def clean_title(node, raw_title):
+    t = str(raw_title)
+    if "doc:" in t or "WebHome" in t or "Temp_Import" in t:
+        t = t.split(".")[-1].replace("WebHome", "").strip()
+        t = re.sub(r'[^a-zA-Z0-9\s]', ' ', t).strip()
+        if not t:
+            t = "an external document"
+    return t
+
+edge_lines = []
+for idx, (u, v, attr) in enumerate(retrieved_edges, 1):
+    src_title = clean_title(u, KG.nodes[u].get("title", u))
+    tgt_title = clean_title(v, KG.nodes[v].get("title", v))
+    predicate = str(attr.get("predicate", "related to")).replace("_", " ")
+    edge_lines.append(f"{idx}. {src_title} {predicate} {tgt_title}.")
+
+GRAPH_EDGE_CONTEXT = "\n".join(edge_lines) if edge_lines else ""
+
+print(f"Context built: {len(candidates)} docs, {len(edge_lines)} relationships")
+
+# ----------------------------------------------------------
+# 3. Prompt construction
+# ----------------------------------------------------------
+SYSTEM_PROMPT = """You are an expert technical assistant.
+CRITICAL RULES:
+1. Answer the user's question ONLY using the retrieved Knowledge Graph context below. Do NOT use outside training knowledge.
+2. If both 'GRAPH RELATIONSHIPS' and 'RAW DOCUMENT TEXT' are empty, reply exactly: "The information is unavailable in the Knowledge Graph."
+3. If context IS present, be analytical. Do not just say the exact answer is missing. Synthesize a detailed answer from whatever relationships and text are available.
+4. Make logical inferences from the edges (e.g. if A 'opens' B, or A 'depends on' B, explain how they relate). Explain what the graph shows about the topic."""
+
+FINAL_PROMPT = f"""
+Question:
+{USER_QUERY}
+---------------------------------------
+RAW DOCUMENT TEXT:
+{FULL_NODE_CONTEXT}
+---------------------------------------
+GRAPH RELATIONSHIPS:
+{GRAPH_EDGE_CONTEXT}
+"""
+
+print("Prompt constructed. Ready for Cell 18 (LLM).")
+print(f"\nApprox prompt length: {len(FINAL_PROMPT)} chars")
