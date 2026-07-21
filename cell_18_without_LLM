@@ -1,0 +1,135 @@
+# ==========================================================
+# Cell 18 : Top-K Document Retrieval (No LLM)
+# Retrieves top-K documents based on user query
+# Returns: title, reference, content for each document
+# No LLM call — pure graph-based keyword retrieval
+# ==========================================================
+import re
+
+# ----------------------------------------------------------
+# User Query
+# ----------------------------------------------------------
+query = """
+Why is being a SQEP important in the context described in the document?
+"""
+
+# ----------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------
+TOP_K = 10       # Number of documents to retrieve
+
+# ----------------------------------------------------------
+# Keyword extraction
+# ----------------------------------------------------------
+STOPWORDS = {"how","can","a","an","new","be","created","create","in","the","what",
+             "is","of","to","and","for","on","it","does","typically","why","are",
+             "with","this","that","from","by","as","at","or","we","i","you","being",
+             "important","context","described","document"}
+
+def get_keywords(text):
+    return set(re.findall(r'[a-z0-9]+', str(text).lower())) - STOPWORDS
+
+query_keywords = get_keywords(query)
+
+# ----------------------------------------------------------
+# Retrieve Top-K Candidates from the Knowledge Graph
+# ----------------------------------------------------------
+def retrieve_candidates(graph, query_kw, top_k=10):
+    # 1. score start nodes by keyword overlap (title + content)
+    node_scores = []
+    for node, attr in graph.nodes(data=True):
+        if not attr.get("content"):                 # skip shell nodes
+            continue
+        title   = attr.get("title", "") or ""
+        content = attr.get("content", "") or ""
+        t_overlap = len(query_kw & get_keywords(title))
+        c_overlap = len(query_kw & get_keywords(content[:2000]))
+        score = t_overlap * 3 + c_overlap
+        if score > 0:
+            node_scores.append((node, score))
+    node_scores.sort(key=lambda x: x[1], reverse=True)
+    start_nodes = [n for n, s in node_scores[:3]]
+
+    # 2. traverse graph 1-hop + 2-hop (both directions)
+    def neighbors_both(n):
+        return set(graph.successors(n)) | set(graph.predecessors(n))
+
+    collected = {s: 0 for s in start_nodes}
+    def explore(frontier, hop):
+        nxt = set()
+        for cur in frontier:
+            for nb in neighbors_both(cur):
+                if nb not in collected:
+                    collected[nb] = hop
+                    nxt.add(nb)
+        return nxt
+    f = explore(set(start_nodes), 1)
+    explore(f, 2)
+
+    # 3. rank collected nodes: keyword + closeness + degree
+    def relevance(n):
+        a = graph.nodes[n]
+        text = (a.get("title","") or "") + " " + (a.get("content","") or "")[:2000]
+        kw   = len(query_kw & get_keywords(text))
+        hop  = collected.get(n, 99)
+        deg  = a.get("degree", graph.degree(n))
+        return kw * 5 + (3 - min(hop, 3)) * 2 + deg * 0.1
+
+    ranked = sorted(collected.keys(), key=relevance, reverse=True)
+
+    # 4. build top-K candidates (content-bearing only)
+    out = []
+    for n in ranked:
+        a = graph.nodes[n]
+        if not a.get("content"):
+            continue
+        out.append({
+            "doc_id":    n,
+            "title":     a.get("title", n),
+            "reference": n,                    # reference = node key
+            "content":   a.get("content", ""),
+            "score":     round(relevance(n), 2),
+        })
+        if len(out) >= top_k:
+            break
+    return out
+
+candidates = retrieve_candidates(KG, query_keywords, top_k=TOP_K)
+
+# ----------------------------------------------------------
+# Display Retrieved Documents with Content & Reference
+# ----------------------------------------------------------
+print("\n")
+print("=" * 90)
+print(f"TOP {TOP_K} RETRIEVED DOCUMENTS (No LLM)")
+print("=" * 90)
+print(f"\nQuery: {query.strip()}\n")
+
+if len(candidates) == 0:
+    print("No documents found for this query.")
+else:
+    for rank, candidate in enumerate(candidates, 1):
+        doc_id    = candidate["doc_id"]
+        node_data = KG.nodes[doc_id]
+
+        content   = node_data.get("content", "No content available")
+        reference = candidate["reference"]
+        title     = candidate["title"]
+        score     = candidate["score"]
+
+        print(f"\n{'-' * 90}")
+        print(f" Rank      : {rank}")
+        print(f" Doc ID    : {doc_id}")
+        print(f" Title     : {title}")
+        print(f" Reference : {reference}")
+        print(f" Score     : {score:.2f}")
+        print(f"{'-' * 90}")
+        print(f" Content   :")
+        print(f" {content[:2000]}")
+        if len(content) > 2000:
+            print(f"  ... [truncated, total {len(content)} chars]")
+        print()
+
+print("=" * 90)
+print(f"Total Retrieved: {len(candidates)} documents")
+print("=" * 90)
