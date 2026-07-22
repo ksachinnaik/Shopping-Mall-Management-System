@@ -1,0 +1,136 @@
+# ==========================================================
+# Cell 28 : LLM-judged via MLflow  (Vector Search vs Knowledge Graph)
+#
+# BEFORE RUNNING, make these two one-line renames:
+#   Cell 18 (KG)   : response = {"predictions": ...}   ->  response_kg = {...}
+#   Cell 27 (VS)   : response = requests.post(...)     ->  http_vs   = requests.post(...)
+# Nothing is pasted here - both payloads are fetched live.
+# ==========================================================
+import mlflow
+import json
+import requests
+import pandas as pd
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+K        = 10
+QUESTION = "How do I open the OpenTCCM model using MTCCM?"
+
+# ----------------------------------------------------------
+# 1. VECTOR SEARCH  -> call the serving endpoint
+# ----------------------------------------------------------
+token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+url   = "https://adb-3955688708870984.4.azuredatabricks.net/serving-endpoints/knowbot-retriever/invocations"
+
+http_vs = requests.post(
+    url,
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    json={"dataframe_records": [{"query": QUESTION, "top_k": K}]},
+    timeout=120,
+)
+http_vs.raise_for_status()
+response_vs = http_vs.json()          # <- dict, straight from the endpoint
+
+# ----------------------------------------------------------
+# 2. KNOWLEDGE GRAPH -> already a dict from Cell 18
+#    Cell 18 must have been run with the SAME question.
+# ----------------------------------------------------------
+# response_kg  comes from Cell 18
+
+# ----------------------------------------------------------
+# 3. Flatten to mlflow's schema: only 'doc_uri' and 'content'
+# ----------------------------------------------------------
+def to_chunks(payload, top_k=K):
+    if isinstance(payload, dict) and "predictions" in payload:
+        data = payload["predictions"][0].get("data", []) or []
+    elif isinstance(payload, dict) and "data" in payload:
+        data = payload["data"] or []
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        data = []
+    return [
+        {"doc_uri": c.get("doc_uri") or c.get("reference", ""),
+         "content": c.get("content", "") or ""}
+        for c in data[:top_k]
+    ]
+
+print("vector search chunks  :", len(to_chunks(response_vs)))
+print("knowledge graph chunks:", len(to_chunks(response_kg)))
+
+# ----------------------------------------------------------
+# 4. Custom LLM-judged Precision@K   (unchanged)
+# ----------------------------------------------------------
+def judged_precision_at_k(request, retrieved_context, k):
+    """
+    LLM-judged Precision@K: Uses MLflow's chunk_relevance judge to determine
+    whether each retrieved chunk is semantically relevant to the query.
+    """
+    judged_precisions = [judges.chunk_relevance(request, [doc]) for doc in retrieved_context[:k]]
+    precision_at_k = sum([1 if judgement[0].value == 'yes' else 0 for judgement in judged_precisions]) / k
+
+    rationales = [
+        f"""## Chunk {i+1}: `{retrieved_context[i].get('doc_uri', 'unknown')}`\n- **{judged_precisions[i][0].value}**: {judged_precisions[i][0].rationale}"""
+        for i in range(len(judged_precisions))
+    ]
+
+    return Feedback(
+        name=f'judged_precision_at_{k}',
+        value=precision_at_k,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE", source_id="chunk_relevance_judge")
+    )
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    """Judged Precision@10 - fraction of top-10 chunks judged relevant by LLM."""
+    return judged_precision_at_k(request=request, retrieved_context=retrieved_context, k=K)
+
+# ----------------------------------------------------------
+# 5. Build eval_data   (row 0 = vector search, row 1 = knowledge graph)
+# ----------------------------------------------------------
+eval_data_1 = [
+    {"request": QUESTION, "retrieved_context": response_vs},
+    {"request": QUESTION, "retrieved_context": response_kg},
+]
+
+eval_df = pd.DataFrame(eval_data_1)
+eval_df["retrieved_context"] = eval_df["retrieved_context"].apply(to_chunks)
+
+eval_data = (
+    eval_df[["request", "retrieved_context"]]
+    .to_dict(orient="records")
+)
+
+# ----------------------------------------------------------
+# 6. Run MLflow evaluate
+# ----------------------------------------------------------
+with mlflow.start_run(run_name="graphrag_retrieval_eval_judged"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["chunk_relevance"]
+            }
+        },
+        extra_metrics=[judged_precision_at_10]
+    )
+
+    print("=" * 60)
+    print("    JUDGED PRECISION@K RESULTS (LLM-judged)")
+    print("=" * 60)
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+
+# ----------------------------------------------------------
+# 7. Per-system scores (results.metrics averages BOTH rows)
+# ----------------------------------------------------------
+eval_tbl = results.tables["eval_results"].copy()
+eval_tbl.insert(0, "system", ["vector_search", "knowledge_graph"])
+display(eval_tbl)
+
+
+print("judging against:", QUESTION)
+print("KG chunks:", len(to_chunks(response_kg)),
+      " VS chunks:", len(to_chunks(response_vs)))
