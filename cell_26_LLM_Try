@@ -1,0 +1,161 @@
+# ==========================================================
+# Cell 28 : LLM-judged via MLflow  (Vector Search vs Knowledge Graph)
+# ==========================================================
+import mlflow
+import json
+import pandas as pd
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+K = 10
+QUESTION = "How do I open the OpenTCCM model using MTCCM?"
+
+# ----------------------------------------------------------
+# 0. Helpers
+# ----------------------------------------------------------
+def load_json_block(raw, name="payload"):
+    """Parses the FIRST complete JSON value; warns instead of crashing
+    if the paste has leftover braces/brackets at the end."""
+    if isinstance(raw, (dict, list)):
+        return raw
+    s = str(raw).strip()
+    obj, end = json.JSONDecoder().raw_decode(s)
+    if end < len(s):
+        print(f"[{name}] NOTE: ignored {len(s) - end} trailing chars -> {s[end:].strip()[:60]!r}")
+    return obj
+
+def to_chunks(payload, top_k=K):
+    """Accepts {'predictions':[{'data':[...]}]}, {'data':[...]}, or a list.
+    Returns mlflow's schema: only 'doc_uri' and 'content'."""
+    if isinstance(payload, dict) and "predictions" in payload:
+        data = payload["predictions"][0].get("data", []) or []
+    elif isinstance(payload, dict) and "data" in payload:
+        data = payload["data"] or []
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        data = []
+    return [
+        {"doc_uri": c.get("doc_uri") or c.get("reference", ""),
+         "content": c.get("content", "") or ""}
+        for c in data[:top_k]
+    ]
+
+# ----------------------------------------------------------
+# 1. The two retrieval payloads
+#
+#    If `response` / `response_kg` already exist from your
+#    retrieval cells, DELETE this whole section.
+#
+#    Otherwise paste each raw endpoint JSON between the r""" """
+#    markers exactly as it printed - null / \n / \\ all survive.
+# ----------------------------------------------------------
+response = load_json_block(r"""
+{"predictions": [{"data": [
+  {"content": "PASTE VECTOR SEARCH JSON HERE", "title": "", "reference": ""}
+]}]}
+""", "response")
+
+response_kg = load_json_block(r"""
+{"predictions": [{"data": [
+  {"content": "PASTE KNOWLEDGE GRAPH JSON HERE", "title": "", "reference": ""}
+]}]}
+""", "response_kg")
+
+# ----------------------------------------------------------
+# 2. Pre-flight check - do this BEFORE spending judge calls
+# ----------------------------------------------------------
+RETRIEVERS = {"vector_search": response, "knowledge_graph": response_kg}
+
+print(f"{'retriever':<18}{'returned':>10}{'judged':>9}")
+print("-" * 37)
+for nm, pl in RETRIEVERS.items():
+    print(f"{nm:<18}{len(to_chunks(pl, 10_000)):>10}{len(to_chunks(pl, K)):>9}")
+
+if any(len(to_chunks(pl, K)) < K for pl in RETRIEVERS.values()):
+    print(f"\n*** WARNING: a retriever has < {K} chunks. precision@{K} "
+          f"divides by {K}, so it will be capped below 1.0 ***")
+
+# ----------------------------------------------------------
+# 3. Custom LLM-judged Precision@K   (senior's function, unchanged)
+# ----------------------------------------------------------
+def judged_precision_at_k(request, retrieved_context, k):
+    """
+    LLM-judged Precision@K: Uses MLflow's chunk_relevance judge to determine
+    whether each retrieved chunk is semantically relevant to the query.
+    """
+    judged_precisions = [judges.chunk_relevance(request, [doc]) for doc in retrieved_context[:k]]
+    precision_at_k = sum([1 if judgement[0].value == 'yes' else 0 for judgement in judged_precisions]) / k
+
+    rationales = [
+        f"""## Chunk {i+1}: `{retrieved_context[i].get('doc_uri', 'unknown')}`\n- **{judged_precisions[i][0].value}**: {judged_precisions[i][0].rationale}"""
+        for i in range(len(judged_precisions))
+    ]
+
+    return Feedback(
+        name=f'judged_precision_at_{k}',
+        value=precision_at_k,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE", source_id="chunk_relevance_judge")
+    )
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    """Judged Precision@10 - fraction of top-10 chunks judged relevant by LLM."""
+    return judged_precision_at_k(request=request, retrieved_context=retrieved_context, k=K)
+
+# ----------------------------------------------------------
+# 4. Build eval_data  (row 0 = vector search, row 1 = knowledge graph)
+# ----------------------------------------------------------
+eval_data_1 = [
+    {"request": QUESTION, "retrieved_context": response},
+    {"request": QUESTION, "retrieved_context": response_kg},
+]
+
+eval_df = pd.DataFrame(eval_data_1)
+
+# mlflow.entities expects only 'doc_uri' and 'content' keys
+eval_df["retrieved_context"] = eval_df["retrieved_context"].apply(to_chunks)
+
+eval_data = (
+    eval_df[["request", "retrieved_context"]]
+    .to_dict(orient="records")
+)
+
+# ----------------------------------------------------------
+# 5. Run MLflow evaluate
+# ----------------------------------------------------------
+with mlflow.start_run(run_name="graphrag_retrieval_eval_judged"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["chunk_relevance"]
+            }
+        },
+        extra_metrics=[judged_precision_at_10]
+    )
+
+    print("=" * 60)
+    print("    JUDGED PRECISION@K RESULTS (LLM-judged)")
+    print("=" * 60)
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+
+# ----------------------------------------------------------
+# 6. Per-system comparison  (results.metrics is the AVERAGE of both rows)
+# ----------------------------------------------------------
+eval_tbl = results.tables["eval_results"].copy()
+eval_tbl.insert(0, "system", ["vector_search", "knowledge_graph"])
+
+score_cols = ["system"] + [
+    c for c in eval_tbl.columns
+    if "chunk_relevance" in c or "judged_precision" in c
+]
+
+print("\n" + "=" * 60)
+print("    VECTOR SEARCH  vs  KNOWLEDGE GRAPH")
+print("=" * 60)
+display(eval_tbl[score_cols])
+display(eval_tbl)
