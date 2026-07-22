@@ -130,6 +130,8 @@ eval_tbl = results.tables["eval_results"].copy()
 eval_tbl.insert(0, "system", ["vector_search", "knowledge_graph"])
 display(eval_tbl)
 
+print("vector search chunks  :", len(response_vs["predictions"][0]["data"]))
+print("knowledge graph chunks:", len(response_kg["predictions"][0]["data"]))
 
 print("judging against:", QUESTION)
 print("KG chunks:", len(to_chunks(response_kg)),
