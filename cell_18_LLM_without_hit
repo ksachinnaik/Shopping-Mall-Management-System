@@ -1,0 +1,160 @@
+# ==========================================================
+# Cell 18 : Top-K CHUNK Retrieval from Knowledge Graph (No LLM)
+# Output format: {"predictions": [{"data": [{content, title, reference}]}]}
+# ==========================================================
+import re
+import hashlib
+import json
+
+query = """
+Why is being a SQEP important in the context described in the document?
+"""
+
+TOP_K              = 10
+CANDIDATE_NODES    = 40
+CHUNK_SIZE         = 1200
+MIN_CHUNK_CHARS    = 120
+MAX_CHUNKS_PER_DOC = 3
+
+STOPWORDS = {"how","can","a","an","new","be","created","create","in","the","what",
+             "is","of","to","and","for","on","it","does","typically","why","are",
+             "with","this","that","from","by","as","at","or","we","i","you"}
+
+def get_keywords(text):
+    return set(re.findall(r'[a-z0-9]+', str(text).lower())) - STOPWORDS
+
+query_keywords = get_keywords(query)
+
+# ----------------------------------------------------------
+# Clean + chunk
+# ----------------------------------------------------------
+def clean_text(t):
+    t = re.sub(r'\(%[^%]*%\)', ' ', t or '')
+    t = re.sub(r'\{\{[^}]*\}\}', ' ', t)
+    t = re.sub(r'<[^>]{1,200}>', ' ', t)
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    return re.sub(r'\n{3,}', '\n\n', t).strip()
+
+def split_into_chunks(text, max_chars=CHUNK_SIZE):
+    text = clean_text(text)
+    if not text:
+        return []
+    chunks, buf = [], ""
+    for para in re.split(r'\n\s*\n', text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) > max_chars:
+            if buf:
+                chunks.append(buf.strip()); buf = ""
+            for i in range(0, len(para), max_chars):
+                chunks.append(para[i:i + max_chars].strip())
+        elif len(buf) + len(para) + 2 <= max_chars:
+            buf = (buf + "\n\n" + para) if buf else para
+        else:
+            chunks.append(buf.strip()); buf = para
+    if buf:
+        chunks.append(buf.strip())
+    return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
+
+# ----------------------------------------------------------
+# Step 1 : candidate nodes from the graph (traversal)
+# ----------------------------------------------------------
+def candidate_nodes(graph, qkw, limit=CANDIDATE_NODES):
+    scores = []
+    for n, a in graph.nodes(data=True):
+        if not a.get("content"):
+            continue
+        s = len(qkw & get_keywords(a.get("title","") or "")) * 3 + \
+            len(qkw & get_keywords((a.get("content","") or "")[:4000]))
+        if s > 0:
+            scores.append((n, s))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    start = [n for n, _ in scores[:3]]
+
+    collected = {n: 0 for n in start}
+    def explore(frontier, hop):
+        nxt = set()
+        for cur in frontier:
+            for nb in set(graph.successors(cur)) | set(graph.predecessors(cur)):
+                if nb not in collected:
+                    collected[nb] = hop
+                    nxt.add(nb)
+        return nxt
+    explore(explore(set(start), 1), 2)
+
+    def rank(n):
+        a = graph.nodes[n]
+        kw = len(qkw & get_keywords((a.get("title","") or "") + " " +
+                                    (a.get("content","") or "")[:4000]))
+        return kw * 5 + (3 - min(collected.get(n, 99), 3)) * 2 \
+               + a.get("degree", graph.degree(n)) * 0.1
+
+    ranked = [n for n in sorted(collected, key=rank, reverse=True)
+              if graph.nodes[n].get("content")]
+    return [(n, collected.get(n, 99)) for n in ranked[:limit]]
+
+# ----------------------------------------------------------
+# Step 2 : score chunks, dedupe, take top-K
+# ----------------------------------------------------------
+def retrieve_chunks(graph, qkw, top_k=TOP_K):
+    out, seen = [], set()
+
+    for node, hop in candidate_nodes(graph, qkw):
+        a         = graph.nodes[node]
+        title     = a.get("title", node)
+        reference = node
+        per_doc   = 0
+
+        for chunk in split_into_chunks(a.get("content", "")):
+            if per_doc >= MAX_CHUNKS_PER_DOC:
+                break
+            sig = hashlib.md5(re.sub(r'\W+', ' ', chunk.lower()).strip().encode()).hexdigest()
+            if sig in seen:
+                continue
+            overlap = qkw & get_keywords(chunk)
+            if not overlap:
+                continue
+            seen.add(sig)
+            per_doc += 1
+
+            low   = chunk.lower()
+            score = len(overlap) * 5 \
+                    + (len(overlap) / max(1, len(qkw))) * 10 \
+                    + min(sum(low.count(w) for w in overlap), 12) * 0.5 \
+                    + len(qkw & get_keywords(title)) * 3 \
+                    + (3 - min(hop, 3)) * 1.5
+
+            out.append({
+                "content":   chunk,
+                "title":     title,
+                "reference": reference,
+                "_score":    score,
+            })
+
+    out.sort(key=lambda x: x["_score"], reverse=True)
+    return out[:top_k]
+
+chunks = retrieve_chunks(KG, query_keywords, top_k=TOP_K)
+
+# ----------------------------------------------------------
+# Build response payload  (same shape as vector search)
+# ----------------------------------------------------------
+response = {
+    "predictions": [
+        {
+            "data": [
+                {
+                    "content":   c["content"],
+                    "title":     c["title"],
+                    "reference": c["reference"],
+                }
+                for c in chunks
+            ]
+        }
+    ]
+}
+
+print("Status Code: 200\n")
+print("Response:")
+print(json.dumps(response, indent=2, ensure_ascii=False))
