@@ -1,37 +1,78 @@
 # ==========================================================
-# Cell 18 : Top-K CHUNK Retrieval from Knowledge Graph (No LLM)
-# Output format: {"predictions": [{"data": [{content, title, reference}]}]}
+# Cell 18 : Top-K CHUNK Retrieval from Knowledge Graph
+# Output: {"predictions": [{"data": [{content, title, reference}]}]}
 # ==========================================================
 import re
-import hashlib
+import math
 import json
+from collections import Counter
 
 query = """
 Why is being a SQEP important in the context described in the document?
 """
 
 TOP_K              = 10
-CANDIDATE_NODES    = 40
+CANDIDATE_NODES    = 60      # wider net than before
 CHUNK_SIZE         = 1200
-MIN_CHUNK_CHARS    = 120
-MAX_CHUNKS_PER_DOC = 3
-
-STOPWORDS = {"how","can","a","an","new","be","created","create","in","the","what",
-             "is","of","to","and","for","on","it","does","typically","why","are",
-             "with","this","that","from","by","as","at","or","we","i","you"}
-
-def get_keywords(text):
-    return set(re.findall(r'[a-z0-9]+', str(text).lower())) - STOPWORDS
-
-query_keywords = get_keywords(query)
+MIN_CHUNK_CHARS    = 150
+MAX_CHUNKS_PER_DOC = 2
+SIM_THRESHOLD      = 0.45    # lower = stricter dedup
 
 # ----------------------------------------------------------
-# Clean + chunk
+# Tokenizing.  No hardcoded stopword list — IDF (built below)
+# learns which words are common in YOUR corpus and down-weights
+# them automatically.
+# ----------------------------------------------------------
+def tokens(text):
+    return re.findall(r'[a-z0-9]+', str(text).lower())
+
+def token_set(text):
+    return set(tokens(text))
+
+# ----------------------------------------------------------
+# Build IDF over the loaded documents (once)
+# ----------------------------------------------------------
+def build_idf(graph):
+    df, n_docs = Counter(), 0
+    for _, a in graph.nodes(data=True):
+        c = a.get("content")
+        if not c:
+            continue
+        n_docs += 1
+        for w in set(tokens((a.get("title","") or "") + " " + c)):
+            df[w] += 1
+    return {w: math.log((n_docs + 1) / (c + 1)) + 1.0 for w, c in df.items()}, n_docs
+
+IDF, N_DOCS = build_idf(KG)
+
+def weighted_overlap(query_terms, text_tokens):
+    """Sum of IDF weights for query terms present in the text."""
+    return sum(IDF.get(w, 1.0) for w in query_terms if w in text_tokens)
+
+# ----------------------------------------------------------
+# Query terms + phrases (phrases catch acronyms / multi-word terms)
+# ----------------------------------------------------------
+q_tokens  = tokens(query)
+q_terms   = set(q_tokens)
+q_phrases = [" ".join(q_tokens[i:i+2]) for i in range(len(q_tokens)-1)]
+q_weight  = sum(IDF.get(w, 1.0) for w in q_terms) or 1.0
+
+print(f"Query terms ranked by IDF (higher = more distinctive):")
+for w in sorted(q_terms, key=lambda x: IDF.get(x, 1.0), reverse=True)[:8]:
+    print(f"   {w:<20} {IDF.get(w, 1.0):.2f}")
+print()
+
+# ----------------------------------------------------------
+# Cleaning — strip wiki links / macros, the main duplicate source
 # ----------------------------------------------------------
 def clean_text(t):
-    t = re.sub(r'\(%[^%]*%\)', ' ', t or '')
+    t = t or ''
+    t = re.sub(r'\(%[^%]*%\)', ' ', t)
     t = re.sub(r'\{\{[^}]*\}\}', ' ', t)
     t = re.sub(r'<[^>]{1,200}>', ' ', t)
+    t = re.sub(r'\[\[([^\]>]+)>>[^\]]+\]\]', r'\1', t)
+    t = re.sub(r'\(doc:[^)]+\)', ' ', t)
+    t = re.sub(r'https?://\S+', ' ', t)
     t = re.sub(r'[ \t]{2,}', ' ', t)
     return re.sub(r'\n{3,}', '\n\n', t).strip()
 
@@ -58,19 +99,32 @@ def split_into_chunks(text, max_chars=CHUNK_SIZE):
     return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
 
 # ----------------------------------------------------------
-# Step 1 : candidate nodes from the graph (traversal)
+# Near-duplicate check: containment, not equality
 # ----------------------------------------------------------
-def candidate_nodes(graph, qkw, limit=CANDIDATE_NODES):
+def is_near_duplicate(text, accepted_sets):
+    ts = token_set(text)
+    if not ts:
+        return True
+    for prev in accepted_sets:
+        if len(ts & prev) / min(len(ts), len(prev)) > SIM_THRESHOLD:
+            return True
+    return False
+
+# ----------------------------------------------------------
+# Step 1 : candidate nodes — IDF-weighted match + graph traversal
+# ----------------------------------------------------------
+def candidate_nodes(graph, limit=CANDIDATE_NODES):
     scores = []
     for n, a in graph.nodes(data=True):
         if not a.get("content"):
             continue
-        s = len(qkw & get_keywords(a.get("title","") or "")) * 3 + \
-            len(qkw & get_keywords((a.get("content","") or "")[:4000]))
+        t_tok = token_set(a.get("title","") or "")
+        c_tok = token_set((a.get("content","") or "")[:6000])
+        s = weighted_overlap(q_terms, t_tok) * 3 + weighted_overlap(q_terms, c_tok)
         if s > 0:
             scores.append((n, s))
     scores.sort(key=lambda x: x[1], reverse=True)
-    start = [n for n, _ in scores[:3]]
+    start = [n for n, _ in scores[:5]]           # 5 seeds, was 3
 
     collected = {n: 0 for n in start}
     def explore(frontier, hop):
@@ -85,74 +139,88 @@ def candidate_nodes(graph, qkw, limit=CANDIDATE_NODES):
 
     def rank(n):
         a = graph.nodes[n]
-        kw = len(qkw & get_keywords((a.get("title","") or "") + " " +
-                                    (a.get("content","") or "")[:4000]))
-        return kw * 5 + (3 - min(collected.get(n, 99), 3)) * 2 \
-               + a.get("degree", graph.degree(n)) * 0.1
+        tok = token_set((a.get("title","") or "") + " " + (a.get("content","") or "")[:6000])
+        return (weighted_overlap(q_terms, tok) * 5
+                + (3 - min(collected.get(n, 99), 3)) * 2
+                + a.get("degree", graph.degree(n)) * 0.1)
 
     ranked = [n for n in sorted(collected, key=rank, reverse=True)
               if graph.nodes[n].get("content")]
+    print(f"Start nodes: {len(start)} | traversed to {len(collected)} nodes\n")
     return [(n, collected.get(n, 99)) for n in ranked[:limit]]
 
 # ----------------------------------------------------------
-# Step 2 : score chunks, dedupe, take top-K
+# Step 2 : score every chunk, THEN dedupe during selection
+#          (so the best version of a duplicate group survives)
 # ----------------------------------------------------------
-def retrieve_chunks(graph, qkw, top_k=TOP_K):
-    out, seen = [], set()
+def retrieve_chunks(graph, top_k=TOP_K):
+    scored = []
 
-    for node, hop in candidate_nodes(graph, qkw):
-        a         = graph.nodes[node]
-        title     = a.get("title", node)
-        reference = node
-        per_doc   = 0
+    for node, hop in candidate_nodes(graph):
+        a        = graph.nodes[node]
+        title    = a.get("title", node)
+        t_tok    = token_set(title)
 
         for chunk in split_into_chunks(a.get("content", "")):
-            if per_doc >= MAX_CHUNKS_PER_DOC:
-                break
-            sig = hashlib.md5(re.sub(r'\W+', ' ', chunk.lower()).strip().encode()).hexdigest()
-            if sig in seen:
+            c_tok = token_set(chunk)
+            w_ov  = weighted_overlap(q_terms, c_tok)
+            if w_ov == 0:
                 continue
-            overlap = qkw & get_keywords(chunk)
-            if not overlap:
-                continue
-            seen.add(sig)
-            per_doc += 1
 
-            low   = chunk.lower()
-            score = len(overlap) * 5 \
-                    + (len(overlap) / max(1, len(qkw))) * 10 \
-                    + min(sum(low.count(w) for w in overlap), 12) * 0.5 \
-                    + len(qkw & get_keywords(title)) * 3 \
+            low = chunk.lower()
+            # phrase bonus: exact 2-word sequences from the query
+            phrase_hits = sum(1 for p in q_phrases if p in low)
+            # term frequency, capped so long chunks don't dominate
+            tf = sum(min(low.count(w), 3) * IDF.get(w, 1.0) for w in q_terms if w in c_tok)
+
+            score = (w_ov / q_weight) * 25 \
+                    + tf * 1.5 \
+                    + phrase_hits * 8 \
+                    + weighted_overlap(q_terms, t_tok) * 3 \
                     + (3 - min(hop, 3)) * 1.5
 
-            out.append({
-                "content":   chunk,
-                "title":     title,
-                "reference": reference,
-                "_score":    score,
-            })
+            scored.append({"content": chunk, "title": title,
+                           "reference": node, "_score": score})
 
-    out.sort(key=lambda x: x["_score"], reverse=True)
-    return out[:top_k]
+    scored.sort(key=lambda x: x["_score"], reverse=True)
 
-chunks = retrieve_chunks(KG, query_keywords, top_k=TOP_K)
+    def select(pool, max_per_doc, sim_thresh):
+        chosen, sets, per_doc = [], [], {}
+        for c in pool:
+            ref = c["reference"]
+            if per_doc.get(ref, 0) >= max_per_doc:
+                continue
+            ts = token_set(c["content"])
+            if any(len(ts & p) / min(len(ts), len(p)) > sim_thresh for p in sets):
+                continue
+            chosen.append(c); sets.append(ts)
+            per_doc[ref] = per_doc.get(ref, 0) + 1
+            if len(chosen) >= top_k:
+                break
+        return chosen
+
+    selected = select(scored, MAX_CHUNKS_PER_DOC, SIM_THRESHOLD)
+
+    # fallback: if too few came back, relax the per-doc cap
+    if len(selected) < top_k and len(scored) > len(selected):
+        print(f"[relaxing per-doc cap — only {len(selected)} chunks passed]\n")
+        selected = select(scored, 4, SIM_THRESHOLD)
+
+    print(f"Chunks scored: {len(scored)} | after dedup: {len(selected)}\n")
+    return selected
+
+chunks = retrieve_chunks(KG, top_k=TOP_K)
 
 # ----------------------------------------------------------
-# Build response payload  (same shape as vector search)
+# Response payload
 # ----------------------------------------------------------
 response = {
-    "predictions": [
-        {
-            "data": [
-                {
-                    "content":   c["content"],
-                    "title":     c["title"],
-                    "reference": c["reference"],
-                }
-                for c in chunks
-            ]
-        }
-    ]
+    "predictions": [{
+        "data": [
+            {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+            for c in chunks
+        ]
+    }]
 }
 
 print("Status Code: 200\n")
