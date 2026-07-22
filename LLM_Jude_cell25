@@ -1,0 +1,125 @@
+# ==========================================================
+# Cell 28 : LLM-judged via MLflow  (Vector Search vs Knowledge Graph)
+# ==========================================================
+import mlflow
+import json
+import pandas as pd
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+# ----------------------------------------------------------
+# 1. The two retrieval payloads
+#    Paste the raw endpoint JSON between the r""" """ markers.
+#    r"""...""" = raw string, so \n and \\ survive; json.loads
+#    then handles null / true / false correctly.
+# ----------------------------------------------------------
+response = json.loads(r"""
+{
+  "predictions": [
+    {
+      "data": [
+        {
+          "content": "PASTE VECTOR SEARCH CHUNK 1 CONTENT HERE",
+          "title": "MTCCM Help: FAQs",
+          "reference": "Temp_Import.65419109-231f-11f1-8720-005056902ed8.WebHome"
+        }
+      ],
+      "completeness_score": 1.0,
+      "error": null,
+      "status_code": 200
+    }
+  ]
+}
+""")
+
+response_kg = json.loads(r"""
+{
+  "predictions": [
+    {
+      "data": [
+        {
+          "content": "PASTE KNOWLEDGE GRAPH CHUNK 1 CONTENT HERE",
+          "title": "MTCCM Help: MTCCM.Run OpenTCCM",
+          "reference": "Temp_Import.0003c355-2348-11f1-8720-005056902ed8.WebHome"
+        }
+      ]
+    }
+  ]
+}
+""")
+
+# ----------------------------------------------------------
+# 2. Custom LLM-judged Precision@K
+# ----------------------------------------------------------
+def judged_precision_at_k(request, retrieved_context, k):
+    """
+    LLM-judged Precision@K: Uses MLflow's chunk_relevance judge to determine
+    whether each retrieved chunk is semantically relevant to the query.
+    """
+    judged_precisions = [judges.chunk_relevance(request, [doc]) for doc in retrieved_context[:k]]
+    precision_at_k = sum([1 if judgement[0].value == 'yes' else 0 for judgement in judged_precisions]) / k
+
+    rationales = [
+        f"""## Chunk {i+1}: `{retrieved_context[i].get('doc_uri', 'unknown')}`\n- **{judged_precisions[i][0].value}**: {judged_precisions[i][0].rationale}"""
+        for i in range(len(judged_precisions))
+    ]
+
+    return Feedback(
+        name=f'judged_precision_at_{k}',
+        value=precision_at_k,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE", source_id="chunk_relevance_judge")
+    )
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    """Judged Precision@10 - fraction of top-10 chunks judged relevant by LLM."""
+    return judged_precision_at_k(request=request, retrieved_context=retrieved_context, k=10)
+
+# ----------------------------------------------------------
+# 3. Build eval_df from the two payloads
+# ----------------------------------------------------------
+eval_data_1 = [
+    {"request": "How do I open the OpenTCCM model using MTCCM?", "retrieved_context": response},
+    {"request": "How do I open the OpenTCCM model using MTCCM?", "retrieved_context": response_kg},
+]
+
+eval_df = pd.DataFrame(eval_data_1)
+
+# mlflow.entities expects only 'doc_uri' and 'content' keys
+eval_df["retrieved_context"] = eval_df["retrieved_context"].apply(
+    lambda payload: [
+        {"doc_uri": c.get("reference", ""), "content": c.get("content", "")}
+        for c in payload["predictions"][0]["data"]
+    ] if isinstance(payload, dict) else payload
+)
+
+# Build eval_data with: request ; retrieved_context   (no response)
+eval_data = (
+    eval_df[["request", "retrieved_context"]]
+    .to_dict(orient="records")
+)
+
+# ----------------------------------------------------------
+# 4. Run MLflow evaluate
+# ----------------------------------------------------------
+with mlflow.start_run(run_name="graphrag_retrieval_eval_judged"):
+    results = mlflow.evaluate(
+        data=eval_data,
+        model_type="databricks-agent",
+        evaluator_config={
+            "databricks-agent": {
+                "metrics": ["chunk_relevance"]
+            }
+        },
+        extra_metrics=[judged_precision_at_10]
+    )
+
+    print("=" * 60)
+    print("    JUDGED PRECISION@K RESULTS (LLM-judged)")
+    print("=" * 60)
+    print(f"\nAll metrics: {results.metrics}")
+    print("=" * 60)
+
+# Row 0 = vector search, Row 1 = knowledge graph
+display(results.tables["eval_results"])
