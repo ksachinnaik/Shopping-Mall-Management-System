@@ -1,0 +1,124 @@
+# ==========================================================
+# Cell 28 : LLM-judged — Vector Search vs Knowledge Graph
+# ==========================================================
+import mlflow
+import requests
+import pandas as pd
+from mlflow.entities import Feedback, AssessmentSource
+from databricks.agents.evals import metric, judges
+
+K        = 10
+QUESTION = "How do I open the OpenTCCM model using MTCCM?"
+
+token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+VS_URL = "https://adb-3955688708870984.4.azuredatabricks.net/serving-endpoints/knowbot-retriever/invocations"
+
+# ----------------------------------------------------------
+# 1. VECTOR SEARCH — live call
+# ----------------------------------------------------------
+http_vs = requests.post(
+    VS_URL,
+    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    json={"dataframe_records": [{"query": QUESTION, "top_k": K}]},
+    timeout=120,
+)
+http_vs.raise_for_status()
+response_vs = http_vs.json()
+
+# ----------------------------------------------------------
+# 2. KNOWLEDGE GRAPH — retrieve HERE with the SAME question
+#    (do not reuse response_kg from Cell 18 — its query may differ)
+# ----------------------------------------------------------
+query_keywords = get_keywords(QUESTION)          # from Cell 18
+kg_chunks = retrieve_chunks(KG, top_k=K)         # from Cell 18
+
+response_kg = {"predictions": [{"data": [
+    {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+    for c in kg_chunks
+]}]}
+
+# ----------------------------------------------------------
+# 3. Flatten to mlflow schema
+# ----------------------------------------------------------
+def to_chunks(payload, top_k=K):
+    if isinstance(payload, dict) and "predictions" in payload:
+        data = payload["predictions"][0].get("data", []) or []
+    elif isinstance(payload, dict) and "data" in payload:
+        data = payload["data"] or []
+    elif isinstance(payload, list):
+        data = payload
+    else:
+        data = []
+    return [{"doc_uri": c.get("doc_uri") or c.get("reference", ""),
+             "content": c.get("content", "") or ""} for c in data[:top_k]]
+
+vs_ctx = to_chunks(response_vs)
+kg_ctx = to_chunks(response_kg)
+print("vector search chunks  :", len(vs_ctx))
+print("knowledge graph chunks:", len(kg_ctx))
+
+# ----------------------------------------------------------
+# 4. Judged Precision@K — divides by ACTUAL chunk count
+# ----------------------------------------------------------
+def judged_precision_at_k(request, retrieved_context, k):
+    ctx = retrieved_context[:k]
+    if not ctx:
+        return Feedback(
+            name=f'judged_precision_at_{k}', value=0.0,
+            rationale="No chunks retrieved.",
+            source=AssessmentSource(source_type="LLM_JUDGE",
+                                    source_id="chunk_relevance_judge"))
+
+    judged = [judges.chunk_relevance(request, [doc]) for doc in ctx]
+    hits = sum(1 for j in judged if j[0].value == 'yes')
+    precision_at_k = hits / len(ctx)          # <-- actual count, not k
+
+    rationales = [
+        f"""## Chunk {i+1}: `{ctx[i].get('doc_uri', 'unknown')}`\n- **{judged[i][0].value}**: {judged[i][0].rationale}"""
+        for i in range(len(judged))
+    ]
+    return Feedback(
+        name=f'judged_precision_at_{k}', value=precision_at_k,
+        rationale='\n'.join(rationales),
+        source=AssessmentSource(source_type="LLM_JUDGE",
+                                source_id="chunk_relevance_judge"))
+
+@metric
+def judged_precision_at_10(request, retrieved_context):
+    return judged_precision_at_k(request, retrieved_context, K)
+
+# ----------------------------------------------------------
+# 5. Evaluate each system SEPARATELY (metrics stay comparable)
+# ----------------------------------------------------------
+def run_eval(system, ctx):
+    with mlflow.start_run(run_name=f"retrieval_eval_{system}"):
+        res = mlflow.evaluate(
+            data=[{"request": QUESTION, "retrieved_context": ctx}],
+            model_type="databricks-agent",
+            evaluator_config={"databricks-agent": {"metrics": ["chunk_relevance"]}},
+            extra_metrics=[judged_precision_at_10],
+        )
+    return res
+
+res_vs = run_eval("vector_search",   vs_ctx)
+res_kg = run_eval("knowledge_graph", kg_ctx)
+
+print("=" * 60)
+print("    JUDGED PRECISION@K RESULTS (LLM-judged)")
+print("=" * 60)
+for name, res, n in [("vector_search", res_vs, len(vs_ctx)),
+                     ("knowledge_graph", res_kg, len(kg_ctx))]:
+    print(f"\n{name}  ({n} chunks)")
+    for k, v in res.metrics.items():
+        if "precision" in k or "relevance" in k:
+            print(f"   {k}: {v}")
+print("=" * 60)
+
+# ----------------------------------------------------------
+# 6. Read the rationales — this tells you WHY chunks failed
+# ----------------------------------------------------------
+tbl = res_kg.tables["eval_results"]
+col = [c for c in tbl.columns if "rationale" in c.lower()]
+if col:
+    print("\nKG judge rationales:\n")
+    print(str(tbl.iloc[0][col[0]])[:3000])
