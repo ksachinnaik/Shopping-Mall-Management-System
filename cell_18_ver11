@@ -1,0 +1,273 @@
+# ==========================================================
+# Cell 18 : Top-K CHUNK Retrieval from Knowledge Graph (No LLM)
+# BM25 scoring + graph traversal + layered dedup
+# Output: {"predictions": [{"data": [{content, title, reference}]}]}
+# ==========================================================
+import re
+import math
+import json
+import hashlib
+from collections import Counter
+
+query = """
+Why is being a SQEP important in the context described in the document?
+"""
+
+TOP_K              = 10
+CANDIDATE_NODES    = 80
+CHUNK_SIZE         = 900      # smaller = more precise passages
+CHUNK_STRIDE       = 700      # sliding window step (overlap = 200)
+MIN_CHUNK_CHARS    = 120
+MAX_CHUNKS_PER_DOC = 2
+JACCARD_THRESHOLD  = 0.25
+CONTAIN_THRESHOLD  = 0.50
+SHINGLE_N          = 6
+
+# BM25 parameters (standard values)
+BM25_K1 = 1.5     # term-frequency saturation
+BM25_B  = 0.75    # length normalization strength
+
+GRAPH_BOOST   = 2.0   # weight of graph proximity
+TITLE_BOOST   = 1.5   # weight of title match
+PHRASE_BOOST  = 3.0   # weight of exact phrase hits
+
+# ----------------------------------------------------------
+# Tokenizing
+# ----------------------------------------------------------
+def tokens(text):
+    return re.findall(r'[a-z0-9]+', str(text).lower())
+
+def token_set(text):
+    return set(tokens(text))
+
+def shingles(text, n=SHINGLE_N):
+    w = tokens(text)
+    return {" ".join(w[i:i+n]) for i in range(max(0, len(w) - n + 1))}
+
+def norm_hash(text):
+    return hashlib.md5(" ".join(tokens(text)).encode()).hexdigest()
+
+# ----------------------------------------------------------
+# Cleaning
+# ----------------------------------------------------------
+def clean_text(t):
+    t = t or ''
+    t = re.sub(r'\(%[^%]*%\)', ' ', t)
+    t = re.sub(r'\{\{[^}]*\}\}', ' ', t)
+    t = re.sub(r'<[^>]{1,200}>', ' ', t)
+    t = re.sub(r'\[\[([^\]>]+)>>[^\]]+\]\]', r'\1', t)
+    t = re.sub(r'\(doc:[^)]+\)', ' ', t)
+    t = re.sub(r'https?://\S+', ' ', t)
+    t = re.sub(r'[ \t]{2,}', ' ', t)
+    return re.sub(r'\n{3,}', '\n\n', t).strip()
+
+# ----------------------------------------------------------
+# Chunking: sliding window over sentences (no mid-sentence cuts)
+# ----------------------------------------------------------
+def split_into_chunks(text, size=CHUNK_SIZE, stride=CHUNK_STRIDE):
+    text = clean_text(text)
+    if not text:
+        return []
+    # split to sentences/lines, then pack into windows
+    units = [u.strip() for u in re.split(r'(?<=[.!?])\s+|\n+', text) if u.strip()]
+    if not units:
+        return []
+    chunks, buf, start_idx = [], "", 0
+    i = 0
+    while i < len(units):
+        buf, j = "", i
+        while j < len(units) and len(buf) + len(units[j]) + 1 <= size:
+            buf = (buf + " " + units[j]).strip()
+            j += 1
+        if j == i:                      # single oversized unit
+            chunks.append(units[i][:size])
+            i += 1
+            continue
+        if len(buf) >= MIN_CHUNK_CHARS:
+            chunks.append(buf)
+        # advance by stride worth of characters
+        adv, k = 0, i
+        while k < j and adv < stride:
+            adv += len(units[k]) + 1
+            k += 1
+        i = max(k, i + 1)
+    return chunks
+
+# ----------------------------------------------------------
+# STEP 1: build the chunk corpus ONCE (BM25 needs corpus stats)
+# ----------------------------------------------------------
+print("Building chunk corpus...")
+CORPUS = []          # [{content, title, reference, tf, len}]
+DF     = Counter()
+
+for node, attr in KG.nodes(data=True):
+    content = attr.get("content")
+    if not content:
+        continue
+    title = attr.get("title", node)
+    for ch in split_into_chunks(content):
+        tf = Counter(tokens(ch))
+        if not tf:
+            continue
+        CORPUS.append({
+            "content":   ch,
+            "title":     title,
+            "reference": node,
+            "tf":        tf,
+            "len":       sum(tf.values()),
+        })
+        for w in tf:
+            DF[w] += 1
+
+N_CHUNKS = len(CORPUS)
+AVG_LEN  = sum(c["len"] for c in CORPUS) / max(1, N_CHUNKS)
+
+# BM25 IDF (with the standard +0.5 smoothing)
+BM25_IDF = {
+    w: math.log(1 + (N_CHUNKS - df + 0.5) / (df + 0.5))
+    for w, df in DF.items()
+}
+
+print(f"Corpus: {N_CHUNKS} chunks | avg length {AVG_LEN:.0f} tokens "
+      f"| vocab {len(DF)}\n")
+
+# ----------------------------------------------------------
+# STEP 2: graph traversal -> proximity score per document
+# ----------------------------------------------------------
+def graph_proximity(graph, q_terms):
+    """Returns {node: hop_distance} from the best-matching seed nodes."""
+    seeds = []
+    for n, a in graph.nodes(data=True):
+        if not a.get("content"):
+            continue
+        t_tok = token_set(a.get("title","") or "")
+        c_tok = token_set((a.get("content","") or "")[:8000])
+        s = (sum(BM25_IDF.get(w, 0) for w in q_terms if w in t_tok) * 3
+             + sum(BM25_IDF.get(w, 0) for w in q_terms if w in c_tok))
+        if s > 0:
+            seeds.append((n, s))
+    seeds.sort(key=lambda x: x[1], reverse=True)
+    start = [n for n, _ in seeds[:5]]
+
+    hops = {n: 0 for n in start}
+    frontier = set(start)
+    for hop in (1, 2):
+        nxt = set()
+        for cur in frontier:
+            for nb in set(graph.successors(cur)) | set(graph.predecessors(cur)):
+                if nb not in hops:
+                    hops[nb] = hop
+                    nxt.add(nb)
+        frontier = nxt
+
+    print(f"Graph: {len(start)} seed nodes -> {len(hops)} reachable nodes")
+    return hops
+
+# ----------------------------------------------------------
+# STEP 3: BM25 score + graph boost + dedup
+# ----------------------------------------------------------
+def retrieve_chunks(graph, query_text, top_k=TOP_K):
+    q_tok   = tokens(query_text)
+    q_terms = set(q_tok)
+    q_phr   = [" ".join(q_tok[i:i+2]) for i in range(len(q_tok)-1)]
+
+    print("Top query terms by IDF:")
+    for w in sorted(q_terms, key=lambda x: BM25_IDF.get(x, 0), reverse=True)[:6]:
+        print(f"   {w:<20} {BM25_IDF.get(w, 0):.2f}"
+              f"{'   <-- NOT IN CORPUS' if w not in BM25_IDF else ''}")
+    print()
+
+    hops = graph_proximity(graph, q_terms)
+
+    scored = []
+    for c in CORPUS:
+        # --- BM25 core ---
+        bm25 = 0.0
+        for w in q_terms:
+            f = c["tf"].get(w, 0)
+            if f == 0:
+                continue
+            idf   = BM25_IDF.get(w, 0)
+            denom = f + BM25_K1 * (1 - BM25_B + BM25_B * c["len"] / AVG_LEN)
+            bm25 += idf * (f * (BM25_K1 + 1)) / denom
+        if bm25 == 0:
+            continue
+
+        # --- graph proximity: closer to a seed = higher ---
+        hop   = hops.get(c["reference"], 99)
+        gprox = (3 - min(hop, 3)) / 3.0 * GRAPH_BOOST
+
+        # --- title match ---
+        t_tok = token_set(c["title"])
+        tscore = sum(BM25_IDF.get(w, 0) for w in q_terms if w in t_tok) * TITLE_BOOST
+
+        # --- exact phrase hits ---
+        low = c["content"].lower()
+        pscore = sum(1 for p in q_phr if p in low) * PHRASE_BOOST
+
+        scored.append({
+            "content":   c["content"],
+            "title":     c["title"],
+            "reference": c["reference"],
+            "_score":    bm25 + gprox + tscore + pscore,
+            "_bm25":     bm25,
+            "_hop":      hop,
+        })
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+
+    # --- layered dedup during selection ---
+    chosen, hashes, shing, toks, per_doc, dropped = [], set(), [], [], {}, 0
+    for c in scored:
+        if len(chosen) >= top_k:
+            break
+        if per_doc.get(c["reference"], 0) >= MAX_CHUNKS_PER_DOC:
+            continue
+        txt = c["content"]
+
+        h = norm_hash(txt)
+        if h in hashes:
+            dropped += 1; continue
+
+        sh = shingles(txt)
+        if sh and any(len(sh & p) / len(sh | p) > JACCARD_THRESHOLD for p in shing):
+            dropped += 1; continue
+
+        ts = token_set(txt)
+        if ts and any(len(ts & p) / min(len(ts), len(p)) > CONTAIN_THRESHOLD for p in toks):
+            dropped += 1; continue
+
+        chosen.append(c)
+        hashes.add(h); shing.append(sh); toks.append(ts)
+        per_doc[c["reference"]] = per_doc.get(c["reference"], 0) + 1
+
+    print(f"Matched: {len(scored)} chunks | duplicates dropped: {dropped} "
+          f"| selected: {len(chosen)}\n")
+    return chosen
+
+chunks = retrieve_chunks(KG, query, top_k=TOP_K)
+
+# ----------------------------------------------------------
+# Diagnostics — read this before trusting the scores
+# ----------------------------------------------------------
+print("-" * 70)
+for i, c in enumerate(chunks, 1):
+    print(f"{i:>2}. score={c['_score']:6.2f}  bm25={c['_bm25']:5.2f}  "
+          f"hop={c['_hop']}  {c['title'][:45]}")
+print("-" * 70, "\n")
+
+# ----------------------------------------------------------
+# Response payload
+# ----------------------------------------------------------
+response = {
+    "predictions": [{
+        "data": [
+            {"content": c["content"], "title": c["title"], "reference": c["reference"]}
+            for c in chunks
+        ]
+    }]
+}
+
+print("Status Code: 200\n")
+print("Response:")
+print(json.dumps(response, indent=2, ensure_ascii=False))
